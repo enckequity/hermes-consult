@@ -43743,7 +43743,7 @@ var Store = class {
     const columns = this.all("PRAGMA table_info(leads)").map((c) => c.name);
     if (!columns.includes("handed"))
       this.db.exec(
-        "ALTER TABLE leads ADD COLUMN handed INTEGER NOT NULL DEFAULT 0; ALTER TABLE leads ADD COLUMN ref TEXT;UPDATE leads SET handed=1,ref='before-handoff'; UPDATE sites SET owner='local';"
+        "ALTER TABLE leads ADD COLUMN handed INTEGER NOT NULL DEFAULT 0; ALTER TABLE leads ADD COLUMN ref TEXT;UPDATE leads SET handed=1,ref='before-handoff'; UPDATE sites SET owner='local';UPDATE sites SET published=NULL WHERE json_extract(draft,'$.key') IS NULL;"
       );
     this.db.prepare(
       "UPDATE consultations SET status='interrupted',ended=? WHERE status='active'"
@@ -44071,7 +44071,7 @@ function createApp(options) {
     "cf-connecting-ip",
     "true-client-ip"
   ];
-  const proxied = (req) => PROXY_HEADERS.some((h) => req.headers[h] !== void 0);
+  const proxied = (req) => Object.keys(req.headers).some((h) => h.startsWith("x-forwarded-") || PROXY_HEADERS.includes(h));
   app.use(["/api", "/connector"], (req, _res, next) => {
     if (proxied(req)) fail(404, "errNotFound");
     next();

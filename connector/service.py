@@ -172,7 +172,6 @@ class Service:
         self.errors = []
         self.site_errors = {}
         self.sites_file_errors = []
-        self.lead_error = ""
         self.lead_retry = {}
         self.next_start = 0.0
 
@@ -193,6 +192,9 @@ class Service:
     def start(self, settings):
         port = settings["port"]
         with socket.socket() as probe:
+            # Like the server itself: a live listener still fails the probe, while connections
+            # left in TIME_WAIT by a crashed server do not block the restart.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind(("127.0.0.1", port))
             except OSError:
@@ -213,7 +215,10 @@ class Service:
         challenge = self.secret(TURNSTILE_KEY)
         if challenge:
             env[TURNSTILE_KEY] = challenge
-        # The server's own errors go to consult/server.log, replaced on each start.
+        # The server's own errors go to consult/server.log; the previous run's log is kept as
+        # server.log.1, so a crash stays readable after the restart.
+        if (self.data / "server.log").exists():
+            os.replace(self.data / "server.log", self.data / "server.log.1")
         log = os.open(self.data / "server.log", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             self.process = subprocess.Popen(
@@ -255,11 +260,13 @@ class Service:
         """Create or update each configured site and publish it. With ``prune``, a site no longer
         listed is unpublished: its widget, sessions and contact form stop."""
         self.site_errors = {}
-        existing = {}
+        existing, keyless = {}, []
         for row in self.request("/api/sites"):
             key = row["draft"].get("key")
             if key:
                 existing[key] = row
+            else:
+                keyless.append(row)
         for site in sites:
             key = site["key"]
             try:
@@ -274,7 +281,8 @@ class Service:
         if not prune:
             return
         listed = {site["key"] for site in sites}
-        for key, row in existing.items():
+        # A site without a key was not made from sites.json, so it is never listed there.
+        for key, row in [*existing.items(), *((r["id"], r) for r in keyless)]:
             if key in listed or not row["published"]:
                 continue
             try:
@@ -287,11 +295,19 @@ class Service:
         errors = []
         for site in self.request("/api/sites"):
             existing = self.connectors.get(site["id"])
-            if (existing and existing[1].is_alive()) or not site["published"]:
+            if not site["published"] or not site["draft"].get("key"):
+                # Stop the connector of a site that was unpublished; never pair a keyless site.
+                if existing:
+                    existing[0].stop.set()
+                    existing[0].voice.shutdown()
+                    del self.connectors[site["id"]]
+                continue
+            if existing and existing[1].is_alive():
                 continue
             runtime = self.runtime_factory()
             if not runtime.available():
-                return ["model access is unavailable to the plugin"]
+                errors.append("model access is unavailable to the plugin")
+                break
             connector = Connector(self.base, runtime, self.settings["voice_enabled"])
             try:
                 code = self.request("/api/sites/%s/pair" % site["id"], "POST", {})["code"]
@@ -307,13 +323,17 @@ class Service:
             thread.start()
         return errors
 
-    def hand_off_leads(self):
-        if self.settings["lead_handoff"] != "kanban":
+    def hand_off_leads(self, blocked=False):
+        """File pending leads. ``blocked`` (an invalid handoff setting) leaves them pending rather
+        than filing them somewhere unintended."""
+        if self.settings["lead_handoff"] != "kanban" or blocked:
             return
-        self.lead_error = ""
         now = self.clock()
-        for lead in self.request("/api/leads/pending"):
-            attempts, not_before = self.lead_retry.get(lead["id"], (0, 0.0))
+        pending = self.request("/api/leads/pending")
+        # Forget retry state of leads the server no longer holds.
+        self.lead_retry = {k: v for k, v in self.lead_retry.items() if k in {l["id"] for l in pending}}
+        for lead in pending:
+            attempts, not_before, _ = self.lead_retry.get(lead["id"], (0, 0.0, ""))
             if now < not_before:
                 continue
             try:
@@ -321,8 +341,8 @@ class Service:
             except Exception as error:
                 # The lead stays pending and is retried later (1 min, doubling to 1 h); later
                 # leads are still handed off.
-                self.lead_retry[lead["id"]] = (attempts + 1, now + min(3600, 60 * 2 ** attempts))
-                self.lead_error = "lead handoff failed: %s" % (str(error)[:200] or type(error).__name__)
+                message = "lead handoff failed: %s" % (str(error)[:200] or type(error).__name__)
+                self.lead_retry[lead["id"]] = (attempts + 1, now + min(3600, 60 * 2 ** attempts), message)
                 continue
             self.lead_retry.pop(lead["id"], None)
             try:
@@ -364,12 +384,12 @@ class Service:
                 if sites is not None:
                     # A site dropped for a validation error is not "removed": prune only a clean file.
                     self.apply(sites, prune=not site_errors)
-                    self.applied = digest
+                self.applied = digest
             errors.extend(self.sites_file_errors)
             errors.extend(self.sync_connectors())
-            self.hand_off_leads()
-            if self.lead_error:
-                errors.append(self.lead_error)
+            self.hand_off_leads(blocked=any(
+                e.startswith(("lead_handoff", "kanban_board")) for e in errors))
+            errors.extend(sorted({entry[2] for entry in self.lead_retry.values()}))
         self.errors = errors
         self.write_status()
 

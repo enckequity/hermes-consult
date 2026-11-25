@@ -105,7 +105,7 @@ test("control API needs the token and refuses proxied requests even with it", as
   assert.equal((await app.admin("/api/sites")).status, 200);
   for (const header of [
     "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded", "Via",
-    "X-Real-IP", "CF-Connecting-IP", "True-Client-IP",
+    "X-Real-IP", "CF-Connecting-IP", "True-Client-IP", "X-Forwarded-Port", "X-Forwarded-Prefix",
   ]) {
     const proxied = { Authorization: "Bearer " + TOKEN, [header]: "1.2.3.4" };
     assert.equal((await app.call("/api/sites", { headers: proxied })).status, 404, header);
@@ -238,12 +238,16 @@ test("an upstream database is adopted without refiling its old leads", () => {
     "CREATE TABLE leads(id TEXT PRIMARY KEY,session TEXT UNIQUE NOT NULL,site TEXT NOT NULL,name TEXT NOT NULL,contact TEXT NOT NULL,message TEXT NOT NULL,created INTEGER NOT NULL);" +
       "INSERT INTO leads VALUES ('l1','l1','s','n','c','m',1);" +
       "CREATE TABLE sites(id TEXT PRIMARY KEY,owner TEXT NOT NULL,draft TEXT NOT NULL,published TEXT,revision INTEGER NOT NULL DEFAULT 0);" +
-      "INSERT INTO sites(id,owner,draft) VALUES ('site_a','desktop','{}');",
+      "INSERT INTO sites(id,owner,draft,published) VALUES ('site_a','desktop','{}','{}');" +
+      "INSERT INTO sites(id,owner,draft,published) VALUES ('site_b','desktop','{\"key\":\"b\"}','{\"key\":\"b\"}');",
   );
   old.close();
   const store = new Store(path);
   assert.deepEqual({ ...store.get("SELECT handed,ref FROM leads WHERE id='l1'") }, { handed: 1, ref: "before-handoff" });
   assert.equal(store.get("SELECT owner FROM sites WHERE id='site_a'").owner, "local");
+  // A site made outside sites.json (no key) is switched off; a keyed one is left as it was.
+  assert.equal(store.get("SELECT published FROM sites WHERE id='site_a'").published, null);
+  assert.equal(store.get("SELECT published FROM sites WHERE id='site_b'").published, '{"key":"b"}');
   store.close();
 });
 

@@ -27,7 +27,9 @@ export class Store {
     if (!columns.includes("handed"))
       this.db.exec(
         "ALTER TABLE leads ADD COLUMN handed INTEGER NOT NULL DEFAULT 0; ALTER TABLE leads ADD COLUMN ref TEXT;" +
-          "UPDATE leads SET handed=1,ref='before-handoff'; UPDATE sites SET owner='local';",
+          "UPDATE leads SET handed=1,ref='before-handoff'; UPDATE sites SET owner='local';" +
+          // Sites made outside sites.json have no key: they stay stored but off until listed.
+          "UPDATE sites SET published=NULL WHERE json_extract(draft,'$.key') IS NULL;",
       );
     // Process restart invalidates in-memory tokens; keep reserved budget for unknown upstream closure.
     this.db

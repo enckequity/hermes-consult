@@ -379,9 +379,47 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(any("lead handoff failed" in e for e in self.status()["errors"]))
         self.svc.tick(self.settings)
         self.assertEqual(calls, ["Bad", "Good"])  # backing off
+        self.assertTrue(any("lead handoff failed" in e for e in self.status()["errors"]))
         now[0] += 61
         self.svc.tick(self.settings)
         self.assertEqual(calls, ["Bad", "Good", "Bad"])
+
+    def test_invalid_board_leaves_leads_pending(self):
+        settings = {**self.settings, "kanban_board": "Bad Board"}
+        self.tick_until(lambda: self.status()["sites"] and self.status()["sites"][0]["online"], settings)
+        site = self.status()["sites"][0]
+        self.http("/public/sites/%s/leads" % site["id"],
+                  {"name": "Ada", "contact": "ada@example.com", "message": "Hi", "consent": True},
+                  {"Origin": "https://www.example.com"})
+        self.svc.tick(settings)
+        self.assertEqual(self.handed, [])
+        self.tick_until(lambda: len(self.handed) == 1)
+
+    def test_keyless_sites_never_serve_and_are_pruned(self):
+        self.tick_until(lambda: self.status()["sites"] and self.status()["sites"][0]["online"])
+        row = self.svc.request("/api/sites", "POST", {"name": "Old", "origins": ["https://old.example"]})
+        self.svc.request("/api/sites/%s/publish" % row["id"], "POST", {})
+        self.svc.tick(self.settings)
+        self.assertNotIn(row["id"], self.svc.connectors)
+        self.write_sites([{"key": "main", "name": "Shop", "origins": ["https://www.example.com"],
+                           "cooldownSeconds": 0}])
+        self.tick_until(lambda: not [s for s in self.status()["sites"] if s["id"] == row["id"] and s["published"]])
+
+    def test_sites_error_clears_and_crash_log_is_kept(self):
+        self.tick_until(lambda: self.status()["sites"] and self.status()["sites"][0]["online"])
+        path = self.home / "consult" / "sites.json"
+        good = path.read_text()
+        path.write_text("{broken")
+        self.svc.tick(self.settings)
+        self.assertIn("sites.json is not valid JSON", self.status()["errors"])
+        path.write_text(good)
+        self.svc.tick(self.settings)
+        self.assertEqual(self.status()["errors"], [])
+        (self.home / "consult" / "server.log").write_text("crash details")
+        self.svc.process.kill()
+        self.svc.process.wait()
+        self.tick_until(lambda: self.svc.running())
+        self.assertEqual((self.home / "consult" / "server.log.1").read_text(), "crash details")
 
     def test_handoff_none_keeps_leads_local(self):
         settings = {**self.settings, "lead_handoff": "none"}

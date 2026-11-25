@@ -195,7 +195,8 @@ export function createApp(options: {
     "cf-connecting-ip",
     "true-client-ip",
   ];
-  const proxied = (req: Request) => PROXY_HEADERS.some((h) => req.headers[h] !== undefined);
+  const proxied = (req: Request) =>
+    Object.keys(req.headers).some((h) => h.startsWith("x-forwarded-") || PROXY_HEADERS.includes(h));
   app.use(["/api", "/connector"], (req, _res, next) => {
     if (proxied(req)) fail(404, "errNotFound");
     next();
