@@ -1,16 +1,6 @@
 import { build } from "esbuild";
 import { readFileSync, existsSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-await build({
-  entryPoints: ["desktop/source.tsx"],
-  outfile: "desktop/plugin.js",
-  bundle: true,
-  format: "esm",
-  platform: "browser",
-  target: "chrome120",
-  external: ["react", "react/jsx-runtime", "@hermes/plugin-sdk"],
-  sourcemap: false,
-});
 const result = await build({
   entryPoints: ["src/index.ts"],
   outfile: "dist/server.mjs",

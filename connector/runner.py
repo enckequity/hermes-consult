@@ -1,22 +1,22 @@
-"""Outbound HTTPS long-poll connector; one-time pairing credentials stay in RAM."""
+"""Long-poll connector between the local consultation server and the workspace model.
 
-import argparse
+The service pairs one connector per published site over loopback; the pairing credential
+stays in memory.
+"""
+
 import contextvars
 from concurrent.futures import ThreadPoolExecutor
-import getpass
 import json
-import os
 import threading
 import time
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 from urllib.error import HTTPError
-from .runtime import HermesRuntime
 from .voice import VoiceManager, VoiceServiceError
 
 
 class Connector:
-    def __init__(self, url, runtime, allow_subscription=False, subscription_broker=None):
+    def __init__(self, url, runtime, voice_enabled=False):
         parsed = urlparse(url)
         if parsed.scheme != "https" and not (
             parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1")
@@ -27,7 +27,11 @@ class Connector:
         self.url = url.rstrip("/")
         self.token = ""
         self.runtime = runtime
-        self.voice = VoiceManager(runtime, allow_subscription, subscription_broker)
+        self.voice = VoiceManager(
+            runtime,
+            voice_enabled,
+            lambda session: self.request("/connector/question", {"sessionId": session}),
+        )
         self.stop = threading.Event()
         self.pool = ThreadPoolExecutor(max_workers=8)
         self.results = {}
@@ -71,7 +75,6 @@ class Connector:
         )
         context = contextvars.copy_context()
         threading.Thread(target=lambda: context.run(maintain), daemon=True).start()
-        print("Connected. Credentials remain on this host. Ctrl+C to stop.", flush=True)
         try:
             while not self.stop.is_set():
                 try:
@@ -137,47 +140,3 @@ class Connector:
                 self.stop.wait(1)
         with self.lock:
             self.inflight.discard(ident)
-
-
-def configure(parser):
-    parser.add_argument("--relay", default="http://127.0.0.1:4317")
-    parser.add_argument(
-        "--allow-subscription",
-        action="store_true",
-        help="Experimental subscription lane; no paid fallback",
-    )
-    parser.add_argument(
-        "--demo",
-        action="store_true",
-        help="Clearly labelled local test responses; no AI calls",
-    )
-
-
-def main(args=None):
-    if args is None:
-        parser = argparse.ArgumentParser()
-        configure(parser)
-        args = parser.parse_args()
-    runtime = HermesRuntime(demo=args.demo)
-    if not runtime.available():
-        raise SystemExit(
-            "Hermes plugin LLM access is unavailable. Run this as `hermes consult` with the plugin enabled."
-        )
-    connector = Connector(args.relay, runtime, args.allow_subscription)
-    code = os.environ.pop("CONSULT_PAIR_CODE", None) or getpass.getpass(
-        "One-time connection code: "
-    )
-    try:
-        connector.pair(code)
-        code = ""
-        connector.run()
-    except KeyboardInterrupt:
-        pass
-    except Exception:
-        raise SystemExit(
-            "Connector failed. Check relay, pairing code and provider configuration."
-        )
-
-
-if __name__ == "__main__":
-    main()

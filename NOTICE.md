@@ -1,4 +1,4 @@
-Adapted connector/vendor/codex_broker.py from Dante Labs hermes-live v0.9.0 (MIT). Includes a consultation-specific persona argument. The Desktop subscription lane uses the versioned integration provided by the separately installed Hermes Live plugin.
+This fork removed the account-login voice lane (formerly connector/vendor/codex_broker.py, adapted from Dante Labs hermes-live v0.9.0, MIT) and its Desktop integration. The acknowledgment below is kept for code that remains derived from it.
 
 # Third-party acknowledgments
 

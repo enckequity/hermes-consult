@@ -2,7 +2,6 @@ import {
   greetingEvent,
   transcriptEvent,
   answerEvent,
-  delegationAnswer,
 } from "./voice-protocol.js";
 import { applyI18n, pickLocale, relayError, t } from "./i18n.js";
 const $ = (s) => document.querySelector(s),
@@ -27,7 +26,6 @@ let config,
   starting = false,
   generation = 0;
 let cancelChallenge = null;
-const delegations = new Set();
 let lastTranscript = null,
   greeted = false,
   voiceStats;
@@ -158,7 +156,6 @@ function end() {
   greeted = false;
   voice = false;
   starting = false;
-  delegations.clear();
   if (channel) {
     try {
       if (channel.readyState === "open" && old?.engine === "api")
@@ -247,59 +244,6 @@ async function onEvent(event) {
         node: add(transcript.role, transcript.text),
       };
     $("main").scrollTop = $("main").scrollHeight;
-  }
-  if (type === "delegation.cancelled") {
-    delegations.delete(event.delegation_item_id);
-    return;
-  }
-  if (
-    type === "delegation.created" &&
-    session.engine === "subscription" &&
-    event.item?.target === "client"
-  ) {
-    const id = event.item.id;
-    if (delegations.has(id)) return;
-    delegations.add(id);
-    const text = (event.item.content ?? [])
-      .filter((c) => c.type === "input_text")
-      .map((c) => c.text)
-      .join("\n");
-    if (!text) return;
-    const turn = generation;
-    try {
-      status(T("checkingDocs"));
-      const result = await rpc("ask", {
-        text: text.slice(0, 4000),
-        requestId: id,
-      });
-      if (turn !== generation || !delegations.has(id)) return;
-      if (channel?.readyState === "open")
-        channel.send(
-          JSON.stringify({
-            type: "delegation.context.append",
-            delegation_item_id: id,
-            content: [{ type: "input_text", text: delegationAnswer(result.text) }],
-          }),
-        );
-      status(T("inVoice"));
-    } catch (e) {
-      if (turn !== generation) return;
-      error(e.message);
-      if (channel?.readyState === "open")
-        channel.send(
-          JSON.stringify({
-            type: "delegation.context.append",
-            delegation_item_id: id,
-            content: [
-              {
-                type: "input_text",
-                // Model-facing: English; the voice model answers in the visitor's language.
-                text: "The document lookup failed. Suggest that the visitor leave an inquiry.",
-              },
-            ],
-          }),
-        );
-    }
   }
 }
 async function ice(connection) {
@@ -504,15 +448,17 @@ fetch("/public/sites/" + site)
     }
     $("#name").textContent = c.name;
     $("#greeting").textContent = c.greeting;
+    // Text-only sites never offer voice.
+    $("#start").hidden = c.engine !== "api";
     $("#start").disabled = !c.voiceReady;
     status(
       c.online ? (c.demo ? T("demoReady") : T("available")) : T("offline"),
     );
-    if (!c.voiceReady) $("#start").textContent = T("voicePreparing");
+    if (c.engine === "api" && !c.voiceReady)
+      $("#start").textContent = T("voicePreparing");
   })
   .catch((e) => error(e.message));
 
-// Render only inside our own widget frame, never inside the Desktop renderer.
 let turnstileLoading;
 async function challenge() {
   if (!config?.turnstileSiteKey) return undefined;

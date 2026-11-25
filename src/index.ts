@@ -1,15 +1,17 @@
 import { createApp } from "./app.ts";
-const port = Number(process.env.PORT ?? 4317),
-  host = process.env.HOST ?? "127.0.0.1";
+const port = Number(process.env.PORT ?? 4318);
+// Loopback only. A public origin reaches this listener through a reverse proxy.
+const host = "127.0.0.1";
 const origin = process.env.PUBLIC_ORIGIN ?? `http://127.0.0.1:${port}`;
 const service = createApp({
   dbPath: process.env.DB_PATH ?? ".runtime/consult.sqlite",
   origin,
   turnstileSecret: process.env.HERMES_CONSULT_TURNSTILE_SECRET,
-  desktopToken: process.env.CONSULT_DESKTOP_TOKEN,
+  controlToken: process.env.CONSULT_CONTROL_TOKEN ?? "",
+  proxyHops: Number(process.env.CONSULT_PROXY_HOPS ?? 0) || 0,
 });
 const server = service.app.listen(port, host, () =>
-  console.log(`Hermes Consult: ${origin}`),
+  console.log(`Consultation server on ${host}:${port} for ${origin}`),
 );
 for (const signal of ["SIGINT", "SIGTERM"] as const)
   process.on(signal, () => {
@@ -17,7 +19,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const)
     server.close(() => process.exit(0));
   });
 
-// A gateway crash must not leave a public consultation listener orphaned.
+// A crashed parent must not leave a consultation listener orphaned.
 if (process.env.CONSULT_PARENT_PID) {
   const parent = Number(process.env.CONSULT_PARENT_PID);
   setInterval(() => {
