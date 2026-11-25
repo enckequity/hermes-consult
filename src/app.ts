@@ -185,8 +185,17 @@ export function createApp(options: {
   }
   // The control and connector APIs are for local processes only. A request that came
   // through a proxy (the public origin) is refused even before its credential is checked.
-  const proxied = (req: Request) =>
-    !!(req.headers["x-forwarded-for"] || req.headers.forwarded || req.headers.via);
+  const PROXY_HEADERS = [
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "forwarded",
+    "via",
+    "x-real-ip",
+    "cf-connecting-ip",
+    "true-client-ip",
+  ];
+  const proxied = (req: Request) => PROXY_HEADERS.some((h) => req.headers[h] !== undefined);
   app.use(["/api", "/connector"], (req, _res, next) => {
     if (proxied(req)) fail(404, "errNotFound");
     next();
@@ -367,6 +376,14 @@ export function createApp(options: {
     pairs.set(hash(code), { site: s.id, expires: Date.now() + 300000 });
     res.json({ code, expiresIn: 300 });
   });
+  // A site removed from the configuration stops serving entirely: no widget, sessions or leads.
+  app.post("/api/sites/:id/unpublish", (req, res) => {
+    const s = siteFor(req);
+    store.run("UPDATE sites SET published=NULL WHERE id=?", s.id);
+    for (const session of sessions.values())
+      if (session.site === s.id) finish(session, "removed");
+    res.json({ ok: true });
+  });
   app.post("/api/sites/:id/disconnect", (req, res) => {
     const s = siteFor(req);
     for (const session of sessions.values())
@@ -421,6 +438,17 @@ export function createApp(options: {
     if (!result.changes) fail(404, "errNotFound");
     res.json({ ok: true });
   });
+  function countQuestion(s: Session) {
+    if (s.requests >= s.config.sessionQuestions) fail(429, "errQuestionLimit");
+    const asked = store.get(
+      "SELECT count(*) AS n FROM questions WHERE site=? AND at>=?",
+      s.site,
+      utcDayStart(),
+    ).n;
+    if (asked >= s.config.dailyQuestions) fail(429, "errDailyQuestions");
+    s.requests++;
+    store.run("INSERT INTO questions VALUES (?,?)", s.site, Date.now());
+  }
   function leadCap(site: string, config: Config) {
     const n = store.get(
       "SELECT count(*) AS n FROM leads WHERE site=? AND created>=?",
@@ -449,6 +477,15 @@ export function createApp(options: {
       queue: [],
     });
     res.json({ token, siteId: p.site });
+  });
+  // Voice delegations answer questions too: the connector meters each one against the caps.
+  app.post("/connector/question", (req, res) => {
+    const link = linkFor(req);
+    const { sessionId } = z.object({ sessionId: z.string().max(100) }).parse(req.body);
+    const s = [...sessions.values()].find((x) => x.id === sessionId && x.site === link.site);
+    if (!s) fail(410, "errEnded");
+    countQuestion(s);
+    res.json({ ok: true });
   });
   app.post("/connector/heartbeat", (req, res) => {
     const link = linkFor(req);
@@ -754,15 +791,7 @@ export function createApp(options: {
       return;
     }
     if (s.busy) fail(409, "errQuestionBusy");
-    if (s.requests >= s.config.sessionQuestions) fail(429, "errQuestionLimit");
-    const asked = store.get(
-      "SELECT count(*) AS n FROM questions WHERE site=? AND at>=?",
-      s.site,
-      utcDayStart(),
-    ).n;
-    if (asked >= s.config.dailyQuestions) fail(429, "errDailyQuestions");
-    s.requests++;
-    store.run("INSERT INTO questions VALUES (?,?)", s.site, Date.now());
+    countQuestion(s);
     s.busy = true;
     try {
       const result = await enqueue(s.site, "ask", s.id, {
@@ -853,7 +882,12 @@ export function createApp(options: {
     for (const [key, l] of limits) if (l.until < now) limits.delete(key);
     store.run("DELETE FROM starts WHERE started<?", now - 2 * 86400000);
     store.run("DELETE FROM questions WHERE at<?", now - 2 * 86400000);
-    store.run("DELETE FROM leads WHERE created<?", now - 30 * 86400000);
+    // Handed-off leads are kept 30 days; leads still waiting for handoff 90 days.
+    store.run(
+      "DELETE FROM leads WHERE (handed=1 AND created<?) OR created<?",
+      now - 30 * 86400000,
+      now - 90 * 86400000,
+    );
     store.run("DELETE FROM consultations WHERE started<?", now - 30 * 86400000);
   }, 5000);
   timer.unref();

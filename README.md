@@ -71,7 +71,10 @@ Site fields and caps (all optional except `key`, `name`, `origins`):
 | `turnstileSiteKey` | (none) | optional bot check |
 
 Unknown fields are refused. The service applies the file when it changes. A removed site is
-paused, not deleted. `<HERMES_HOME>/consult/status.json` lists each site's public id, embed
+unpublished (its widget, sessions and contact form stop; its data stays). A missing or
+unreadable file, or one with an invalid site, never removes anything. `enabled: false` pauses
+a site but keeps its contact form. Voice questions count against the same question caps.
+The server's own log is `<HERMES_HOME>/consult/server.log`. `<HERMES_HOME>/consult/status.json` lists each site's public id, embed
 snippet, whether it is online and any error.
 
 Each answer is one tool-free `ctx.llm.complete` call (800 tokens at most) on the workspace's model.
@@ -85,7 +88,8 @@ at `public_origin` that:
 - forwards only `GET /widget.js`, `/frame.js`, `/frame.css`, `/i18n.js`, `/voice-protocol.js`,
   `/frame/<site>`, `/health`, and `GET`/`POST`/`OPTIONS` under `/public/`;
 - does not forward `/api/` or `/connector/` (the server refuses them anyway when they carry
-  `X-Forwarded-For`, `Forwarded` or `Via`);
+  any forwarding header: `X-Forwarded-*`, `Forwarded`, `Via`, `X-Real-IP`, `CF-Connecting-IP`,
+  `True-Client-IP`);
 - adds `X-Forwarded-For`. Set `proxy_hops` to the number of proxies in front, otherwise all
   visitors share one per-IP allowance;
 - adds edge rate limits.

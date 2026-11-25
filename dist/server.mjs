@@ -43743,7 +43743,7 @@ var Store = class {
     const columns = this.all("PRAGMA table_info(leads)").map((c) => c.name);
     if (!columns.includes("handed"))
       this.db.exec(
-        "ALTER TABLE leads ADD COLUMN handed INTEGER NOT NULL DEFAULT 0; ALTER TABLE leads ADD COLUMN ref TEXT;"
+        "ALTER TABLE leads ADD COLUMN handed INTEGER NOT NULL DEFAULT 0; ALTER TABLE leads ADD COLUMN ref TEXT;UPDATE leads SET handed=1,ref='before-handoff'; UPDATE sites SET owner='local';"
       );
     this.db.prepare(
       "UPDATE consultations SET status='interrupted',ended=? WHERE status='active'"
@@ -43777,14 +43777,14 @@ var en = {
   errConnectorOffline: "The consultation server is not connected. Please contact the provider.",
   errConnectorTimeout: "The consultation server did not respond in time.",
   errEnded: "The consultation has ended.",
-  errSiteLimit: "Up to 20 sites per account are supported.",
+  errSiteLimit: "Up to 20 sites are supported.",
   errPairExpired: "The connection code expired or was already used.",
   errAlreadyWaiting: "Already waiting for a job.",
   errWrongLink: "This job belongs to another connection.",
   errVoiceQuota: "The selected voice service has no remaining balance or usage allowance. Please contact the provider.",
   errVoiceAuth: "The selected voice service needs its credentials or access checked.",
   errVoiceUnavailable: "Could not connect to the voice service. Please try again shortly.",
-  errConnectorFailed: "The connected consultation server could not process the request. Check the connection in the admin.",
+  errConnectorFailed: "The consultation service could not process the request. Please try again shortly.",
   errBadResponse: "The consultation server returned an invalid response.",
   errNotPublished: "No published assistant.",
   errOriginNotAllowed: "This website is not registered.",
@@ -43797,7 +43797,7 @@ var en = {
   errDailyVisitor: "You have reached today\u2019s consultation limit.",
   errCooldown: "Please wait a moment before connecting again.",
   errVoiceStarted: "Voice is already connected.",
-  errVoiceNotReady: "The selected voice connection is not ready. Check the admin settings.",
+  errVoiceNotReady: "Voice is not available right now. You can ask by text.",
   errRequestConflict: "This request ID was used with different content.",
   errQuestionBusy: "The previous question is still being answered.",
   errQuestionLimit: "This consultation has reached its question limit.",
@@ -43877,14 +43877,14 @@ var ko = {
   errConnectorOffline: "\uC0C1\uB2F4 \uC11C\uBC84\uAC00 \uC5F0\uACB0\uB418\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4. \uC81C\uACF5\uC790\uC5D0\uAC8C \uBB38\uC758\uD558\uC138\uC694.",
   errConnectorTimeout: "\uC0C1\uB2F4 \uC11C\uBC84 \uC751\uB2F5 \uC2DC\uAC04\uC774 \uCD08\uACFC\uB418\uC5C8\uC2B5\uB2C8\uB2E4.",
   errEnded: "\uC0C1\uB2F4\uC774 \uC885\uB8CC\uB418\uC5C8\uC2B5\uB2C8\uB2E4.",
-  errSiteLimit: "\uACC4\uC815\uB2F9 20\uAC1C \uC0AC\uC774\uD2B8\uAE4C\uC9C0 \uC9C0\uC6D0\uD569\uB2C8\uB2E4.",
+  errSiteLimit: "\uC0AC\uC774\uD2B8\uB294 20\uAC1C\uAE4C\uC9C0 \uC9C0\uC6D0\uD569\uB2C8\uB2E4.",
   errPairExpired: "\uC5F0\uACB0 \uCF54\uB4DC\uAC00 \uB9CC\uB8CC\uB418\uC5C8\uAC70\uB098 \uC774\uBBF8 \uC0AC\uC6A9\uB418\uC5C8\uC2B5\uB2C8\uB2E4.",
   errAlreadyWaiting: "\uC774\uBBF8 \uC791\uC5C5\uC744 \uAE30\uB2E4\uB9AC\uACE0 \uC788\uC2B5\uB2C8\uB2E4.",
   errWrongLink: "\uB2E4\uB978 \uC5F0\uACB0\uC758 \uC791\uC5C5\uC785\uB2C8\uB2E4.",
   errVoiceQuota: "\uC120\uD0DD\uD55C \uC74C\uC131 \uC11C\uBE44\uC2A4\uC758 \uC794\uC561 \uB610\uB294 \uC0AC\uC6A9 \uD55C\uB3C4\uAC00 \uBD80\uC871\uD569\uB2C8\uB2E4. \uC81C\uACF5\uC790\uC5D0\uAC8C \uBB38\uC758\uD558\uC138\uC694.",
   errVoiceAuth: "\uC120\uD0DD\uD55C \uC74C\uC131 \uC11C\uBE44\uC2A4\uC758 \uC778\uC99D \uB610\uB294 \uC811\uADFC \uAD8C\uD55C\uC744 \uD655\uC778\uD574\uC57C \uD569\uB2C8\uB2E4.",
   errVoiceUnavailable: "\uC74C\uC131 \uC11C\uBE44\uC2A4\uC5D0 \uC5F0\uACB0\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4. \uC7A0\uC2DC \uD6C4 \uB2E4\uC2DC \uC2DC\uB3C4\uD558\uC138\uC694.",
-  errConnectorFailed: "\uC5F0\uACB0\uB41C \uC0C1\uB2F4 \uC11C\uBC84\uAC00 \uC694\uCCAD\uC744 \uCC98\uB9AC\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4. \uAD00\uB9AC\uC790\uC5D0\uC11C \uC5F0\uACB0 \uC0C1\uD0DC\uB97C \uD655\uC778\uD558\uC138\uC694.",
+  errConnectorFailed: "\uC0C1\uB2F4 \uC11C\uBE44\uC2A4\uAC00 \uC694\uCCAD\uC744 \uCC98\uB9AC\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4. \uC7A0\uC2DC \uD6C4 \uB2E4\uC2DC \uC2DC\uB3C4\uD558\uC138\uC694.",
   errBadResponse: "\uC0C1\uB2F4 \uC11C\uBC84 \uC751\uB2F5 \uD615\uC2DD\uC774 \uC62C\uBC14\uB974\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.",
   errNotPublished: "\uAC8C\uC2DC\uB41C \uC0C1\uB2F4\uC6D0\uC774 \uC5C6\uC2B5\uB2C8\uB2E4.",
   errOriginNotAllowed: "\uB4F1\uB85D\uB418\uC9C0 \uC54A\uC740 \uD648\uD398\uC774\uC9C0\uC785\uB2C8\uB2E4.",
@@ -43897,7 +43897,7 @@ var ko = {
   errDailyVisitor: "\uC624\uB298\uC758 \uBC29\uBB38\uC790 \uC0C1\uB2F4 \uD69F\uC218\uC5D0 \uB3C4\uB2EC\uD588\uC2B5\uB2C8\uB2E4.",
   errCooldown: "\uBC18\uBCF5 \uC5F0\uACB0\uC744 \uBC29\uC9C0\uD558\uAE30 \uC704\uD574 \uC7A0\uC2DC \uAE30\uB2E4\uB824 \uC8FC\uC138\uC694.",
   errVoiceStarted: "\uC774\uBBF8 \uC74C\uC131 \uC5F0\uACB0\uC744 \uC2DC\uC791\uD588\uC2B5\uB2C8\uB2E4.",
-  errVoiceNotReady: "\uC120\uD0DD\uD55C \uC74C\uC131 \uC5F0\uACB0\uC774 \uC900\uBE44\uB418\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4. \uAD00\uB9AC\uC790 \uC124\uC815\uC744 \uD655\uC778\uD558\uC138\uC694.",
+  errVoiceNotReady: "\uC9C0\uAE08\uC740 \uC74C\uC131\uC744 \uC0AC\uC6A9\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4. \uD14D\uC2A4\uD2B8\uB85C \uC9C8\uBB38\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4.",
   errRequestConflict: "\uAC19\uC740 \uC694\uCCAD ID\uC5D0 \uB2E4\uB978 \uB0B4\uC6A9\uC785\uB2C8\uB2E4.",
   errQuestionBusy: "\uC774\uC804 \uC9C8\uBB38\uC744 \uCC98\uB9AC\uD558\uACE0 \uC788\uC2B5\uB2C8\uB2E4.",
   errQuestionLimit: "\uC774 \uC0C1\uB2F4\uC758 \uC9C8\uBB38 \uD55C\uB3C4\uC5D0 \uB3C4\uB2EC\uD588\uC2B5\uB2C8\uB2E4.",
@@ -44061,7 +44061,17 @@ function createApp(options) {
   function control(req) {
     return hash2(bearer(req)) === hash2(options.controlToken);
   }
-  const proxied = (req) => !!(req.headers["x-forwarded-for"] || req.headers.forwarded || req.headers.via);
+  const PROXY_HEADERS = [
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "forwarded",
+    "via",
+    "x-real-ip",
+    "cf-connecting-ip",
+    "true-client-ip"
+  ];
+  const proxied = (req) => PROXY_HEADERS.some((h) => req.headers[h] !== void 0);
   app.use(["/api", "/connector"], (req, _res, next) => {
     if (proxied(req)) fail(404, "errNotFound");
     next();
@@ -44233,6 +44243,13 @@ function createApp(options) {
     pairs.set(hash2(code), { site: s.id, expires: Date.now() + 3e5 });
     res.json({ code, expiresIn: 300 });
   });
+  app.post("/api/sites/:id/unpublish", (req, res) => {
+    const s = siteFor(req);
+    store.run("UPDATE sites SET published=NULL WHERE id=?", s.id);
+    for (const session of sessions.values())
+      if (session.site === s.id) finish(session, "removed");
+    res.json({ ok: true });
+  });
   app.post("/api/sites/:id/disconnect", (req, res) => {
     const s = siteFor(req);
     for (const session of sessions.values())
@@ -44284,6 +44301,17 @@ function createApp(options) {
     if (!result.changes) fail(404, "errNotFound");
     res.json({ ok: true });
   });
+  function countQuestion(s) {
+    if (s.requests >= s.config.sessionQuestions) fail(429, "errQuestionLimit");
+    const asked = store.get(
+      "SELECT count(*) AS n FROM questions WHERE site=? AND at>=?",
+      s.site,
+      utcDayStart()
+    ).n;
+    if (asked >= s.config.dailyQuestions) fail(429, "errDailyQuestions");
+    s.requests++;
+    store.run("INSERT INTO questions VALUES (?,?)", s.site, Date.now());
+  }
   function leadCap(site, config2) {
     const n = store.get(
       "SELECT count(*) AS n FROM leads WHERE site=? AND created>=?",
@@ -44311,6 +44339,14 @@ function createApp(options) {
       queue: []
     });
     res.json({ token, siteId: p.site });
+  });
+  app.post("/connector/question", (req, res) => {
+    const link = linkFor(req);
+    const { sessionId } = external_exports.object({ sessionId: external_exports.string().max(100) }).parse(req.body);
+    const s = [...sessions.values()].find((x) => x.id === sessionId && x.site === link.site);
+    if (!s) fail(410, "errEnded");
+    countQuestion(s);
+    res.json({ ok: true });
   });
   app.post("/connector/heartbeat", (req, res) => {
     const link = linkFor(req);
@@ -44592,15 +44628,7 @@ function createApp(options) {
       return;
     }
     if (s.busy) fail(409, "errQuestionBusy");
-    if (s.requests >= s.config.sessionQuestions) fail(429, "errQuestionLimit");
-    const asked = store.get(
-      "SELECT count(*) AS n FROM questions WHERE site=? AND at>=?",
-      s.site,
-      utcDayStart()
-    ).n;
-    if (asked >= s.config.dailyQuestions) fail(429, "errDailyQuestions");
-    s.requests++;
-    store.run("INSERT INTO questions VALUES (?,?)", s.site, Date.now());
+    countQuestion(s);
     s.busy = true;
     try {
       const result = await enqueue(s.site, "ask", s.id, {
@@ -44678,7 +44706,11 @@ function createApp(options) {
     for (const [key, l] of limits) if (l.until < now) limits.delete(key);
     store.run("DELETE FROM starts WHERE started<?", now - 2 * 864e5);
     store.run("DELETE FROM questions WHERE at<?", now - 2 * 864e5);
-    store.run("DELETE FROM leads WHERE created<?", now - 30 * 864e5);
+    store.run(
+      "DELETE FROM leads WHERE (handed=1 AND created<?) OR created<?",
+      now - 30 * 864e5,
+      now - 90 * 864e5
+    );
     store.run("DELETE FROM consultations WHERE started<?", now - 30 * 864e5);
   }, 5e3);
   timer.unref();

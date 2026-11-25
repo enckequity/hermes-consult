@@ -22,9 +22,12 @@ export class Store {
   `);
     // Databases created before the lead handoff lack its columns.
     const columns = this.all("PRAGMA table_info(leads)").map((c) => c.name);
+    // Upstream rows: sites move to the single local owner so the service manages them, and
+    // leads collected before the handoff existed are not filed as new cards.
     if (!columns.includes("handed"))
       this.db.exec(
-        "ALTER TABLE leads ADD COLUMN handed INTEGER NOT NULL DEFAULT 0; ALTER TABLE leads ADD COLUMN ref TEXT;",
+        "ALTER TABLE leads ADD COLUMN handed INTEGER NOT NULL DEFAULT 0; ALTER TABLE leads ADD COLUMN ref TEXT;" +
+          "UPDATE leads SET handed=1,ref='before-handoff'; UPDATE sites SET owner='local';",
       );
     // Process restart invalidates in-memory tokens; keep reserved budget for unknown upstream closure.
     this.db

@@ -23,6 +23,7 @@ async function boot(options: { proxyHops?: number } = {}) {
   await new Promise((resolve) => server.once("listening", resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   let polling = true;
+  const connectors: Record<string, string>[] = [];
   const call = async (
     path: string,
     init: { method?: string; body?: unknown; headers?: Record<string, string> } = {},
@@ -49,6 +50,7 @@ async function boot(options: { proxyHops?: number } = {}) {
     const paired = await call("/connector/pair", { body: { code: body.code } });
     const auth = { Authorization: "Bearer " + paired.body.token };
     await call("/connector/heartbeat", { body: { capabilities }, headers: auth });
+    connectors.push(auth);
     void (async () => {
       while (polling) {
         const job = await call("/connector/jobs", { headers: auth }).catch(() => null);
@@ -80,7 +82,7 @@ async function boot(options: { proxyHops?: number } = {}) {
       headers: { Authorization: "Bearer " + token },
     });
   return {
-    call, admin, connect, site, visit, ask,
+    call, admin, connect, site, visit, ask, connectors,
     close() {
       polling = false;
       service.close();
@@ -101,7 +103,10 @@ test("control API needs the token and refuses proxied requests even with it", as
   assert.equal((await app.call("/api/sites")).status, 403);
   assert.equal((await app.call("/api/sites", { headers: { Authorization: "Bearer wrong" } })).status, 403);
   assert.equal((await app.admin("/api/sites")).status, 200);
-  for (const header of ["X-Forwarded-For", "Forwarded", "Via"]) {
+  for (const header of [
+    "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded", "Via",
+    "X-Real-IP", "CF-Connecting-IP", "True-Client-IP",
+  ]) {
     const proxied = { Authorization: "Bearer " + TOKEN, [header]: "1.2.3.4" };
     assert.equal((await app.call("/api/sites", { headers: proxied })).status, 404, header);
     assert.equal((await app.call("/connector/jobs", { headers: proxied })).status, 404, header);
@@ -226,17 +231,60 @@ test("behind a trusted proxy, per-visitor caps use the forwarded address", async
   assert.equal((await app.visit(created.id, { "X-Forwarded-For": "198.51.100.2" })).status, 201);
 });
 
-test("an older database gains the lead handoff columns", () => {
+test("an upstream database is adopted without refiling its old leads", () => {
   const path = join(mkdtempSync(join(tmpdir(), "consult-")), "old.sqlite");
   const old = new DatabaseSync(path);
   old.exec(
     "CREATE TABLE leads(id TEXT PRIMARY KEY,session TEXT UNIQUE NOT NULL,site TEXT NOT NULL,name TEXT NOT NULL,contact TEXT NOT NULL,message TEXT NOT NULL,created INTEGER NOT NULL);" +
-      "INSERT INTO leads VALUES ('l1','l1','s','n','c','m',1);",
+      "INSERT INTO leads VALUES ('l1','l1','s','n','c','m',1);" +
+      "CREATE TABLE sites(id TEXT PRIMARY KEY,owner TEXT NOT NULL,draft TEXT NOT NULL,published TEXT,revision INTEGER NOT NULL DEFAULT 0);" +
+      "INSERT INTO sites(id,owner,draft) VALUES ('site_a','desktop','{}');",
   );
   old.close();
   const store = new Store(path);
-  assert.deepEqual({ ...store.get("SELECT handed,ref FROM leads WHERE id='l1'") }, { handed: 0, ref: null });
+  assert.deepEqual({ ...store.get("SELECT handed,ref FROM leads WHERE id='l1'") }, { handed: 1, ref: "before-handoff" });
+  assert.equal(store.get("SELECT owner FROM sites WHERE id='site_a'").owner, "local");
   store.close();
+});
+
+test("an unpublished site stops serving, sessions and leads", async (t) => {
+  const app = await boot();
+  t.after(() => app.close());
+  const created = await app.site({ cooldownSeconds: 0 });
+  await app.connect(created.id);
+  const session = await app.visit(created.id);
+  assert.equal((await app.admin(`/api/sites/${created.id}/unpublish`, "POST", {})).status, 200);
+  assert.equal((await app.ask(session.body.token, "still there?")).status, 401);
+  assert.equal((await app.call(`/public/sites/${created.id}`)).status, 404);
+  assert.equal((await app.call(`/frame/${created.id}`)).status, 404);
+  assert.equal((await app.visit(created.id)).status, 404);
+  const lead = await app.call(`/public/sites/${created.id}/leads`, {
+    body: { name: "Ada", contact: "ada@example.com", message: "", consent: true },
+    headers: { Origin: WEBSITE },
+  });
+  assert.equal(lead.status, 404);
+});
+
+test("voice delegations are metered against the same question caps", async (t) => {
+  const app = await boot();
+  t.after(() => app.close());
+  const created = await app.site({ sessionQuestions: 2, dailyQuestions: 3, cooldownSeconds: 0, dailyStarts: 10 });
+  await app.connect(created.id);
+  const auth = app.connectors[0];
+  const meter = (sessionId: string) => app.call("/connector/question", { body: { sessionId }, headers: auth });
+  const one = await app.visit(created.id);
+  assert.equal((await meter(one.body.sessionId)).status, 200);
+  assert.equal((await app.ask(one.body.token, "typed")).status, 200);
+  const perSession = await meter(one.body.sessionId);
+  assert.equal(perSession.status, 429);
+  assert.equal(perSession.body.code, "errQuestionLimit");
+  await app.call("/public/session/end", { body: {}, headers: { Authorization: "Bearer " + one.body.token } });
+  const two = await app.visit(created.id);
+  assert.equal((await meter(two.body.sessionId)).status, 200);
+  const daily = await meter(two.body.sessionId);
+  assert.equal(daily.body.code, "errDailyQuestions");
+  assert.equal((await meter("not-a-session")).status, 410);
+  assert.equal((await app.call("/connector/question", { body: { sessionId: two.body.sessionId } })).status, 401);
 });
 
 test("every error code the relay sends has English and Korean text", () => {
@@ -257,4 +305,22 @@ test("visitor-facing files and text name no engine or vendor", () => {
   for (const locale of ["en", "ko"] as const)
     for (const [key, value] of Object.entries(messages[locale]))
       assert.doesNotMatch(String(value), banned, `${locale}.${key}`);
+});
+
+test("the committed bundle matches the source", async () => {
+  const { build } = await import("esbuild");
+  const result = await build({
+    entryPoints: [new URL("../src/index.ts", import.meta.url).pathname],
+    bundle: true,
+    format: "esm",
+    platform: "node",
+    target: "node24",
+    write: false,
+    outfile: new URL("../dist/server.mjs", import.meta.url).pathname,
+    banner: {
+      js: "import {createRequire} from 'node:module'; const require = createRequire(import.meta.url);",
+    },
+  });
+  const committed = readFileSync(new URL("../dist/server.mjs", import.meta.url), "utf8");
+  assert.ok(result.outputFiles[0].text === committed, "dist/server.mjs is stale: run npm run build");
 });

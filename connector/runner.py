@@ -27,7 +27,11 @@ class Connector:
         self.url = url.rstrip("/")
         self.token = ""
         self.runtime = runtime
-        self.voice = VoiceManager(runtime, voice_enabled)
+        self.voice = VoiceManager(
+            runtime,
+            voice_enabled,
+            lambda session: self.request("/connector/question", {"sessionId": session}),
+        )
         self.stop = threading.Event()
         self.pool = ThreadPoolExecutor(max_workers=8)
         self.results = {}

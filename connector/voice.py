@@ -71,10 +71,12 @@ def classify_api_error(error):
 
 
 class LiveAPI:
-    def __init__(self, session_id, payload, runtime):
+    def __init__(self, session_id, payload, runtime, meter=None):
         self.local_id = session_id
         self.payload = payload
         self.runtime = runtime
+        # Counts each delegated question against the session and daily caps; raises when over.
+        self.meter = meter
         self.lifecycle = threading.Lock()
         self.socket = None
         self.closed = threading.Event()
@@ -216,6 +218,8 @@ class LiveAPI:
                     "content": "Checking the consultation documents.",
                 }
             )
+            if self.meter:
+                self.meter(self.local_id)
             snapshot = self.transcript[-30:]
             text = "\n".join(m["role"] + ": " + m["text"] for m in snapshot)[-4000:]
             answer = self.runtime.ask(
@@ -268,9 +272,10 @@ class LiveAPI:
 
 
 class VoiceManager:
-    def __init__(self, runtime, voice_enabled=False):
+    def __init__(self, runtime, voice_enabled=False, meter=None):
         self.runtime = runtime
         self.voice_enabled = bool(voice_enabled)
+        self.meter = meter
         self.calls = {}
         self.cancelled = {}
         self.lock = threading.RLock()
@@ -307,7 +312,7 @@ class VoiceManager:
             }
             self.calls[ident] = call
         try:
-            client = LiveAPI(ident, payload, self.runtime)
+            client = LiveAPI(ident, payload, self.runtime, self.meter)
             call["api"] = client
             result = client.start()
             with self.lock:

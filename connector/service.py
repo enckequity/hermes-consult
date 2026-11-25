@@ -9,7 +9,8 @@ Desktop or dashboard dependency at run time.
   ``kanban``) and ``kanban_board`` (default: the current board).
 * Sites, ``<HERMES_HOME>/consult/sites.json``: ``{"sites": [{"key": "main", "name": ...,
   "origins": [...], ...}]}``. The consultation server validates each site strictly; caps
-  have defaults and cannot be turned off. A site removed from the file is paused.
+  have defaults and cannot be turned off. A site removed from the file is unpublished; a
+  missing or unreadable file changes nothing.
 * Status, ``<HERMES_HOME>/consult/status.json``: running state, errors and, per site, its
   public id and embed snippet.
 
@@ -107,16 +108,17 @@ def parse_settings(raw):
 
 
 def load_sites(path):
-    """``(sites, errors)`` from the sites file. A missing file means no sites."""
+    """``(sites, errors)`` from the sites file. ``sites`` is None when the file is missing or
+    unreadable as a whole: then nothing is applied, so a half-written file never pauses a site."""
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return [], []
+        return None, []
     except (OSError, ValueError):
-        return [], ["sites.json is not valid JSON"]
+        return None, ["sites.json is not valid JSON"]
     items = data.get("sites") if isinstance(data, dict) else None
     if not isinstance(items, list):
-        return [], ['sites.json must be {"sites": [...]}']
+        return None, ['sites.json must be {"sites": [...]}']
     sites, errors, seen = [], [], set()
     for index, site in enumerate(items[:MAX_SITES]):
         key = site.get("key") if isinstance(site, dict) else None
@@ -171,6 +173,7 @@ class Service:
         self.site_errors = {}
         self.sites_file_errors = []
         self.lead_error = ""
+        self.lead_retry = {}
         self.next_start = 0.0
 
     # Consultation server control API (loopback, in-memory token).
@@ -210,10 +213,15 @@ class Service:
         challenge = self.secret(TURNSTILE_KEY)
         if challenge:
             env[TURNSTILE_KEY] = challenge
-        self.process = subprocess.Popen(
-            [self.node, str(self.server)], cwd=str(ROOT), env=env,
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        # The server's own errors go to consult/server.log, replaced on each start.
+        log = os.open(self.data / "server.log", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            self.process = subprocess.Popen(
+                [self.node, str(self.server)], cwd=str(ROOT), env=env,
+                stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            )
+        finally:
+            os.close(log)
         for _ in range(100):
             if self.process.poll() is not None:
                 break
@@ -223,7 +231,7 @@ class Service:
             except (OSError, HTTPError):
                 time.sleep(0.1)
         self.stop()
-        raise RuntimeError("the consultation server did not start")
+        raise RuntimeError("the consultation server did not start (see consult/server.log)")
 
     def stop(self):
         for connector, thread in self.connectors.values():
@@ -243,8 +251,9 @@ class Service:
         self.token = ""
         self.applied = None
 
-    def apply(self, sites):
-        """Create or update each configured site, publish it, and pause sites no longer listed."""
+    def apply(self, sites, prune=True):
+        """Create or update each configured site and publish it. With ``prune``, a site no longer
+        listed is unpublished: its widget, sessions and contact form stop."""
         self.site_errors = {}
         existing = {}
         for row in self.request("/api/sites"):
@@ -262,48 +271,60 @@ class Service:
                 self.request("/api/sites/%s/publish" % ident, "POST", {})
             except HTTPError as error:
                 self.site_errors[key] = _error_code(error)
+        if not prune:
+            return
         listed = {site["key"] for site in sites}
         for key, row in existing.items():
-            if key in listed or row["draft"].get("enabled") is False:
+            if key in listed or not row["published"]:
                 continue
             try:
-                self.request("/api/sites/" + row["id"], "PUT", {**row["draft"], "enabled": False})
-                self.request("/api/sites/%s/publish" % row["id"], "POST", {})
+                self.request("/api/sites/%s/unpublish" % row["id"], "POST", {})
             except HTTPError as error:
                 self.site_errors[key] = _error_code(error)
 
     def sync_connectors(self):
-        """One live connector per published site."""
+        """One live connector per published site. Returns the errors, one per failing site."""
+        errors = []
         for site in self.request("/api/sites"):
             existing = self.connectors.get(site["id"])
             if (existing and existing[1].is_alive()) or not site["published"]:
                 continue
             runtime = self.runtime_factory()
             if not runtime.available():
-                raise RuntimeError("model access is unavailable to the plugin")
+                return ["model access is unavailable to the plugin"]
             connector = Connector(self.base, runtime, self.settings["voice_enabled"])
             try:
                 code = self.request("/api/sites/%s/pair" % site["id"], "POST", {})["code"]
                 connector.pair(code)
-            except Exception:
+            except Exception as error:
                 connector.pool.shutdown(wait=False, cancel_futures=True)
-                raise
+                errors.append("site %s could not connect: %s" % (site["draft"].get("key") or site["id"],
+                                                                 type(error).__name__))
+                continue
             context = contextvars.copy_context()
             thread = threading.Thread(target=lambda c=connector, x=context: x.run(c.run), daemon=True)
             self.connectors[site["id"]] = (connector, thread)
             thread.start()
+        return errors
 
     def hand_off_leads(self):
         if self.settings["lead_handoff"] != "kanban":
             return
         self.lead_error = ""
+        now = self.clock()
         for lead in self.request("/api/leads/pending"):
+            attempts, not_before = self.lead_retry.get(lead["id"], (0, 0.0))
+            if now < not_before:
+                continue
             try:
                 ref = self.handoff(lead, self.settings["kanban_board"])
             except Exception as error:
-                # The lead stays pending and is retried on the next tick.
+                # The lead stays pending and is retried later (1 min, doubling to 1 h); later
+                # leads are still handed off.
+                self.lead_retry[lead["id"]] = (attempts + 1, now + min(3600, 60 * 2 ** attempts))
                 self.lead_error = "lead handoff failed: %s" % (str(error)[:200] or type(error).__name__)
-                return
+                continue
+            self.lead_retry.pop(lead["id"], None)
             try:
                 self.request("/api/leads/%s/handed" % lead["id"], "POST", {"ref": "kanban:" + ref})
             except HTTPError as error:
@@ -311,13 +332,16 @@ class Service:
 
     def tick(self, raw_settings):
         settings, errors = parse_settings(raw_settings)
-        if settings["enabled"] and not errors:
+        if settings["enabled"]:
             if not self.node:
                 errors.append("Node.js 24 or later is required")
             elif not self.server.is_file():
                 errors.append("the built consultation server is missing")
         signature = tuple(settings[k] for k in ("public_origin", "port", "proxy_hops", "voice_enabled"))
-        wanted = settings["enabled"] and not errors
+        # Only a missing origin or runtime stops the server; any other invalid value falls back
+        # to its default and is reported.
+        runnable = bool(self.node) and self.server.is_file()
+        wanted = settings["enabled"] and bool(settings["public_origin"]) and runnable
         if self.process is not None and (not wanted or signature != self.signature or not self.running()):
             self.stop()
         self.settings = settings
@@ -336,14 +360,13 @@ class Service:
                 digest = "missing"
             if digest != self.applied:
                 sites, site_errors = load_sites(sites_file)
-                self.apply(sites)
                 self.sites_file_errors = site_errors
-                self.applied = digest
+                if sites is not None:
+                    # A site dropped for a validation error is not "removed": prune only a clean file.
+                    self.apply(sites, prune=not site_errors)
+                    self.applied = digest
             errors.extend(self.sites_file_errors)
-            try:
-                self.sync_connectors()
-            except RuntimeError as error:
-                errors.append(str(error))
+            errors.extend(self.sync_connectors())
             self.hand_off_leads()
             if self.lead_error:
                 errors.append(self.lead_error)
@@ -403,7 +426,7 @@ def serve(read_settings, home, runtime_factory, interval=5.0, stop=None, **optio
             try:
                 service.tick(read_settings())
             except Exception as error:
-                service.errors = ["service error: %s" % type(error).__name__]
+                service.errors = ["service error: %s: %s" % (type(error).__name__, str(error)[:200])]
                 try:
                     service.write_status()
                 except OSError:
