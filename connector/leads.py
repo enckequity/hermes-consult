@@ -15,15 +15,20 @@ import json
 import re
 import subprocess
 import time
+import unicodedata
 
 HANDOFFS = ("kanban", "none")
 BOARD = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f​-‏ -‮⁦-⁩]")
+# Control (Cc) and format (Cf) characters: terminal controls, zero-width and bidi overrides.
+_STRIPPED = ("Cc", "Cf")
 
 
 def clean(text, limit, newlines=False):
     """Visitor text with control and bidi characters removed, trimmed to ``limit``."""
-    text = _CONTROL.sub("", str(text or ""))
+    text = "".join(
+        c for c in str(text or "")
+        if (newlines and c == "\n") or unicodedata.category(c) not in _STRIPPED
+    )
     if not newlines:
         text = " ".join(text.split())
     return text.strip()[:limit]
