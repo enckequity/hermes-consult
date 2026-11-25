@@ -1,4 +1,8 @@
-"""Voice engines run on provider host. No automatic API fallback."""
+"""Optional voice lane on the workspace owner's own OpenAI key. Off unless enabled in settings.
+
+There is no shared-key or account-login lane and no automatic fallback: without the dedicated
+key, voice is simply unavailable and visitors use text.
+"""
 
 import json
 import threading
@@ -8,7 +12,10 @@ from urllib.error import HTTPError
 from urllib.parse import quote
 from uuid import uuid4
 from .runtime import language_instruction
-from .vendor import codex_broker
+
+# The customer's own key only. The generic OPENAI_API_KEY may belong to the platform, so it is
+# never used here.
+VOICE_KEY = "HERMES_CONSULT_OPENAI_API_KEY"
 
 
 def voice_prompt(config):
@@ -46,11 +53,7 @@ def get_key():
         from agent.secret_scope import get_secret
     except ImportError:
         raise VoiceServiceError("voice_unavailable") from None
-    return (
-        get_secret("HERMES_CONSULT_OPENAI_API_KEY")
-        or get_secret("OPENAI_API_KEY")
-        or ""
-    )
+    return get_secret(VOICE_KEY) or ""
 
 
 class VoiceServiceError(RuntimeError):
@@ -265,13 +268,9 @@ class LiveAPI:
 
 
 class VoiceManager:
-    def __init__(self, runtime, allow_subscription=False, subscription_broker=None):
+    def __init__(self, runtime, voice_enabled=False):
         self.runtime = runtime
-        self.broker = subscription_broker or codex_broker
-        self.allow_subscription = allow_subscription
-        self.subscription_ready = (
-            self.broker.readiness()["available"] if allow_subscription else False
-        )
+        self.voice_enabled = bool(voice_enabled)
         self.calls = {}
         self.cancelled = {}
         self.lock = threading.RLock()
@@ -280,22 +279,26 @@ class VoiceManager:
         import importlib.util
 
         if self.runtime.demo:
-            return {"api": False, "subscription": False, "hermes": True, "demo": True}
+            return {"api": False, "hermes": True, "demo": True}
         return {
-            "api": bool(get_key())
+            "api": self.voice_enabled
+            and bool(get_key())
             and importlib.util.find_spec("websocket") is not None,
-            "subscription": self.allow_subscription and self.subscription_ready,
             "hermes": self.runtime.available(),
-            "demo": self.runtime.demo,
+            "demo": False,
         }
 
     def start(self, ident, payload):
+        if not self.voice_enabled:
+            raise VoiceServiceError("voice_unavailable")
         with self.lock:
             if ident in self.calls or ident in self.cancelled:
                 raise RuntimeError("Duplicate/closed call")
             if len(self.calls) >= 5:
                 raise RuntimeError("Concurrent call limit")
-            engine = payload["config"]["engine"]
+            engine = payload["config"].get("engine")
+            if engine != "api":
+                raise RuntimeError("Unsupported engine")
             call = {
                 "engine": engine,
                 "expires": min(payload["expiresAt"] / 1000, time.time() + 600),
@@ -304,27 +307,12 @@ class VoiceManager:
             }
             self.calls[ident] = call
         try:
-            if engine == "subscription":
-                if not self.allow_subscription:
-                    raise RuntimeError("Subscription voice must be explicitly enabled.")
-                result = self.broker.sessions.start(
-                    ident,
-                    "cove",
-                    payload["offer"],
-                    persona=voice_prompt(payload["config"]),
-                )
-                result = {"answer": result["answer"], "engine": "subscription"}
-            elif engine == "api":
-                client = LiveAPI(ident, payload, self.runtime)
-                call["api"] = client
-                result = client.start()
-            else:
-                raise RuntimeError("Unsupported engine")
+            client = LiveAPI(ident, payload, self.runtime)
+            call["api"] = client
+            result = client.start()
             with self.lock:
                 if ident not in self.calls or ident in self.cancelled:
-                    if call["api"]:
-                        call["api"].close()
-                    self.broker.sessions.stop(ident)
+                    client.close()
                     raise RuntimeError("Cancelled during start")
                 call["lease"] = time.time() + 40
             return result
@@ -338,9 +326,7 @@ class VoiceManager:
             if not call or call["expires"] < time.time():
                 raise RuntimeError("Call expired")
             call["lease"] = time.time() + 40
-            if call["engine"] == "subscription":
-                self.broker.sessions.heartbeat(ident)
-            elif call["api"] and call["api"].closed.is_set():
+            if call["api"] and call["api"].closed.is_set():
                 raise RuntimeError("Voice disconnected")
         return {"ok": True}
 
@@ -348,11 +334,8 @@ class VoiceManager:
         with self.lock:
             call = self.calls.pop(ident, None)
             self.cancelled[ident] = time.time() + 900
-        if call:
-            if call["api"]:
-                call["api"].close()
-            if call["engine"] == "subscription":
-                self.broker.sessions.stop(ident)
+        if call and call["api"]:
+            call["api"].close()
         return {"ok": True}
 
     def reap(self):

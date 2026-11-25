@@ -9,9 +9,9 @@
   const text = ko
     ? { button: "AI 상담", open: "AI 상담 창 열기", frame: "AI 상담" }
     : { button: "AI chat", open: "Open AI consultation", frame: "AI consultation" };
-  if (document.querySelector(`[data-hermes-consult="${site}"]`)) return;
+  if (document.querySelector(`[data-consult-widget="${site}"]`)) return;
   const host = document.createElement("div");
-  host.dataset.hermesConsult = site;
+  host.dataset.consultWidget = site;
   const shadow = host.attachShadow({ mode: "closed" });
   const style = document.createElement("style");
   style.textContent = `:host{all:initial;position:fixed;right:24px;bottom:24px;z-index:2147483000;font-family:system-ui,sans-serif}button{border:0;border-radius:28px;background:#2458cd;color:white;padding:16px 23px;font:600 14px system-ui;box-shadow:0 8px 25px #15346630;cursor:pointer}button:focus-visible{outline:3px solid #8eaff7;outline-offset:3px}iframe{display:block;position:absolute;bottom:70px;right:0;width:380px;height:570px;max-height:calc(100dvh - 115px);max-width:calc(100vw - 32px);border:1px solid #dce3ed;border-radius:18px;box-shadow:0 20px 70px #18395430;background:white}iframe[hidden]{display:none}@media(max-width:450px){:host{right:16px;bottom:16px}iframe{width:calc(100vw - 32px)}}`;

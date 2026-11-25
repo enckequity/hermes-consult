@@ -7,14 +7,11 @@
     "allowImportingTsExtensions": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "jsx": "react-jsx",
     "allowJs": true,
     "checkJs": false
   },
   "include": [
     "src/**/*.ts",
-    "desktop/*.tsx",
-    "desktop/*.d.ts",
-    "desktop/*.ts"
+    "tests/**/*.ts"
   ]
 }

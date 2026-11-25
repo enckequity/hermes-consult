@@ -15492,8 +15492,8 @@ var require_read = __commonJS({
       }
       let length;
       let stream;
-      const verify2 = options.verify;
-      if (verify2 && encoding !== null && !iconv.encodingExists(encoding)) {
+      const verify = options.verify;
+      if (verify && encoding !== null && !iconv.encodingExists(encoding)) {
         return next(createError(415, 'unsupported charset "' + encoding.toUpperCase() + '"', {
           charset: encoding.toLowerCase(),
           type: "charset.unsupported"
@@ -15520,7 +15520,7 @@ var require_read = __commonJS({
       }
       const rawBodyOptions = {
         length,
-        encoding: verify2 ? null : encoding,
+        encoding: verify ? null : encoding,
         limit: options.limit
       };
       debug("read body");
@@ -15551,10 +15551,10 @@ var require_read = __commonJS({
           stream.destroy();
           req.resume();
         }
-        if (verify2) {
+        if (verify) {
           try {
             debug("verify body");
-            verify2(req, res, body, encoding);
+            verify(req, res, body, encoding);
           } catch (err) {
             next(createError(403, err, {
               body,
@@ -15638,19 +15638,19 @@ var require_utils = __commonJS({
       const inflate = options?.inflate !== false;
       const limit = typeof options?.limit === "undefined" || options?.limit === null ? 102400 : bytes.parse(options.limit);
       const type = options?.type || defaultType;
-      const verify2 = options?.verify || false;
+      const verify = options?.verify || false;
       const defaultCharset = options?.defaultCharset || "utf-8";
       if (limit === null) {
         throw new TypeError(`option limit "${String(options.limit)}" is invalid`);
       }
-      if (verify2 !== false && typeof verify2 !== "function") {
+      if (verify !== false && typeof verify !== "function") {
         throw new TypeError("option verify must be function");
       }
       const shouldParse = typeof type !== "function" ? typeChecker(type) : type;
       return {
         inflate,
         limit,
-        verify: verify2,
+        verify,
         defaultCharset,
         shouldParse
       };
@@ -43719,26 +43719,11 @@ import { fileURLToPath } from "node:url";
 
 // src/store.ts
 import { DatabaseSync } from "node:sqlite";
-import {
-  randomBytes,
-  createHash,
-  scryptSync,
-  timingSafeEqual
-} from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { mkdirSync, chmodSync } from "node:fs";
 import { dirname } from "node:path";
 var secret = () => randomBytes(32).toString("base64url");
 var hash2 = (v) => createHash("sha256").update(v).digest("hex");
-function password(value, salt = secret()) {
-  return `${salt}:${scryptSync(value, salt, 64).toString("hex")}`;
-}
-function verify(value, encoded) {
-  const [salt, digest] = encoded.split(":");
-  return timingSafeEqual(
-    Buffer.from(password(value, salt).split(":")[1], "hex"),
-    Buffer.from(digest, "hex")
-  );
-}
 var Store = class {
   db;
   constructor(path) {
@@ -43749,12 +43734,17 @@ var Store = class {
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
    CREATE TABLE IF NOT EXISTS starts(site TEXT NOT NULL,identity TEXT NOT NULL,started INTEGER NOT NULL);
    CREATE INDEX IF NOT EXISTS starts_identity ON starts(site,identity,started);
-   CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL);
-   CREATE TABLE IF NOT EXISTS logins(token TEXT PRIMARY KEY,owner TEXT NOT NULL,expires INTEGER NOT NULL);
+   CREATE TABLE IF NOT EXISTS questions(site TEXT NOT NULL,at INTEGER NOT NULL);
+   CREATE INDEX IF NOT EXISTS questions_site ON questions(site,at);
    CREATE TABLE IF NOT EXISTS sites(id TEXT PRIMARY KEY,owner TEXT NOT NULL,draft TEXT NOT NULL,published TEXT,revision INTEGER NOT NULL DEFAULT 0);
    CREATE TABLE IF NOT EXISTS consultations(id TEXT PRIMARY KEY,site TEXT NOT NULL,started INTEGER NOT NULL,ended INTEGER,status TEXT NOT NULL,reserved INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0,revision INTEGER NOT NULL,engine TEXT NOT NULL);
-   CREATE TABLE IF NOT EXISTS leads(id TEXT PRIMARY KEY,session TEXT UNIQUE NOT NULL,site TEXT NOT NULL,name TEXT NOT NULL,contact TEXT NOT NULL,message TEXT NOT NULL,created INTEGER NOT NULL);
+   CREATE TABLE IF NOT EXISTS leads(id TEXT PRIMARY KEY,session TEXT UNIQUE NOT NULL,site TEXT NOT NULL,name TEXT NOT NULL,contact TEXT NOT NULL,message TEXT NOT NULL,created INTEGER NOT NULL,handed INTEGER NOT NULL DEFAULT 0,ref TEXT);
   `);
+    const columns = this.all("PRAGMA table_info(leads)").map((c) => c.name);
+    if (!columns.includes("handed"))
+      this.db.exec(
+        "ALTER TABLE leads ADD COLUMN handed INTEGER NOT NULL DEFAULT 0; ALTER TABLE leads ADD COLUMN ref TEXT;"
+      );
     this.db.prepare(
       "UPDATE consultations SET status='interrupted',ended=? WHERE status='active'"
     ).run(Date.now());
@@ -43780,18 +43770,13 @@ var en = {
   errInput: "Check the entered values.",
   errOrigin: "Enter an HTTPS website origin without a path.",
   errTooMany: "Too many requests. Please try again shortly.",
-  errDesktopOnly: "Available only from the Desktop settings panel.",
-  errDesktopAuth: "This server uses Desktop authentication.",
   errForbidden: "This request is not allowed.",
-  errLoginRequired: "Please sign in.",
   errSiteNotFound: "Site not found.",
   errLinkExpired: "The connection credential expired. Reconnect.",
   errSessionEnded: "The consultation has ended. Please start again.",
   errConnectorOffline: "The consultation server is not connected. Please contact the provider.",
   errConnectorTimeout: "The consultation server did not respond in time.",
   errEnded: "The consultation has ended.",
-  errEmailTaken: "This email is already registered.",
-  errBadCredentials: "Check your email and password.",
   errSiteLimit: "Up to 20 sites per account are supported.",
   errPairExpired: "The connection code expired or was already used.",
   errAlreadyWaiting: "Already waiting for a job.",
@@ -43816,8 +43801,10 @@ var en = {
   errRequestConflict: "This request ID was used with different content.",
   errQuestionBusy: "The previous question is still being answered.",
   errQuestionLimit: "This consultation has reached its question limit.",
-  errUseDesktop: "Use the Desktop settings panel.",
   errShuttingDown: "The service is shutting down.",
+  errNotFound: "Not found.",
+  errDailyQuestions: "Today\u2019s question limit for this website has been reached. You can leave a contact request.",
+  errDailyLeads: "Today\u2019s contact request limit has been reached. Please try again tomorrow.",
   // Visitor frame.
   frameTitle: "AI consultation",
   assistant: "AI assistant",
@@ -43875,149 +43862,21 @@ var en = {
   challengeFailed: "The bot check failed.",
   challengeExpired: "The bot check expired.",
   challengeStartFailed: "Could not start the bot check.",
-  previousCleanup: "Cleaning up the previous connection. Please try again.",
-  // Standalone admin (index.html / admin.js).
-  adminTitle: "Hermes Consult \u2014 Consultation admin",
-  adminHeroHtml: "One conversation,<br />started from your website.",
-  adminLeadHtml: "Visitors press a button,<br />and your Hermes starts the consultation.",
-  adminNoteHtml: "Documents and rules in one place.<br />Server credentials stay on the provider\u2019s machine.",
-  loginTitle: "Sign in to consultation admin",
-  registerTitle: "Create a provider account",
-  providerSpace: "A workspace for service providers.",
-  email: "Email",
-  password: "Password",
-  passwordPlaceholder: "At least 12 characters",
-  login: "Sign in",
-  register: "Create account",
-  toRegister: "New here? Create an account",
-  toLogin: "I already have an account",
-  mySites: "My consultation sites",
-  newSite: "+ New consultation site",
-  logout: "Sign out",
-  admin: "Consultation admin",
-  firstSite: "Create your first assistant",
-  notConnected: "Not connected",
-  tabSetup: "Settings",
-  tabConnect: "Connect & install",
-  tabActivity: "Activity",
-  setupTitle: "What will your assistant help with?",
-  setupHelp: "After you save and publish, new consultations use the new settings. Previews use the published settings.",
-  siteName: "Assistant name",
-  siteNamePlaceholder: "e.g. Mono Studio assistant",
-  greeting: "Greeting",
-  greetingPlaceholder: "Hello. I\u2019m an AI assistant. How can I help?",
-  origins: "Website origins",
-  originsHelp: "Enter origins only, without paths. Put each site on its own line.",
-  standardsTitle: "Set your consultation standards",
-  standardsBody1: "Answers stay within confirmed documents; unknown questions are referred to an inquiry.",
-  standardsBody2: "This version answers from documents and takes inquiries. It does not process payments, refunds or booking changes.",
-  rules: "Answer rules",
-  rulesPlaceholder: "Do not confirm prices. Refer anything not in the documents to staff.",
-  knowledge: "Consultation documents",
-  importText: "Import text file",
-  knowledgePlaceholder: "Enter company information, services, FAQs, prices and policies.",
-  knowledgeHelp: "Up to 40,000 characters. TXT and Markdown files can be imported.",
-  engine: "Voice connection",
-  engineApi: "GPT-Live API \xB7 usage billed",
-  engineSubscription: "hermes-live \xB7 subscription (experimental)",
-  language: "Answer language",
-  languageAuto: "Automatic (page language)",
-  maxSeconds: "Maximum duration (seconds)",
-  maxConcurrent: "Concurrent consultations",
-  dailySeconds: "Daily reserved allowance (seconds)",
-  enginesNote: "Voice engines never switch automatically. Document lookups and text answers use the model configured in Hermes and may incur separate costs. The daily allowance conservatively reserves the maximum duration when each consultation starts.",
-  unpublished: "Not published",
-  saveDraft: "Save draft",
-  savePublish: "Save and publish",
-  connectTitle: "From Hermes connection to website installation",
-  connectHelp: "Credentials never go into website code. Start the connection from the provider\u2019s computer.",
-  step1: "Prepare the connector on the provider server",
-  step1Help: "Install the project on the provider server, then run the command below. See the README for paths and environment setup.",
-  step1NoteHtml: "Subscription voice requires <code>--allow-subscription</code> on a server with a Codex login. API keys are managed in the server\u2019s Hermes secret settings.",
-  step2: "Connect with a one-time code",
-  step2Help: "Issue a code and paste it into the connector prompt. It can be used once within 5 minutes.",
-  pair: "Issue connection code",
-  disconnect: "Disconnect",
-  step3: "Paste the snippet into your website",
-  step3HelpHtml: "Paste it before <code>&lt;/body&gt;</code> in your site\u2019s shared HTML, or in its external script setting.",
-  copySnippet: "Copy snippet",
-  preview: "Installation preview",
-  previewNote: "The preview address must also be an allowed website origin. Voice works on HTTPS or localhost.",
-  activityTitle: "Recent consultations and inquiries",
-  activityHelp: "Conversation text and audio are not stored. Only consultation times and inquiries submitted by visitors are kept.",
-  refresh: "Refresh",
-  leads: "Inquiries",
-  recent: "Recent consultations",
-  started: "Started",
-  engineColumn: "Connection",
-  used: "Time used",
-  status: "Status",
-  requestFailed: "Request failed",
-  defaultSiteName: "New assistant",
-  defaultRules: "Say you do not know anything that is not in the documents and suggest leaving an inquiry. Do not confirm quotes or schedules.",
-  hermesConnected: "Hermes connected",
-  hermesDisconnected: "Hermes not connected",
-  capabilities: "Document answers {0} / API voice {1} / Subscription voice {2}{3}",
-  ready: "ready",
-  notReady: "not ready",
-  keySet: "key set",
-  keyMissing: "not configured",
-  enabled: "enabled",
-  disabled: "disabled",
-  demoConnector: " / demo connector",
-  pairHint: "Issue a connection code and run the connector on the provider server.",
-  revision: "Published version {0} \xB7 edits are saved as a draft",
-  neverPublished: "Not published yet",
-  siteCreated: "Assistant created. Add documents and rules, then publish.",
-  published: "Published. New consultations use these settings.",
-  draftSaved: "Draft saved. Live consultations do not use it yet.",
-  knowledgeLimit: "Documents can contain up to 40,000 characters.",
-  fileLoaded: "File loaded into the draft. Save or publish it.",
-  pairValid: "The connection code is valid for 5 minutes. After a server restart, reconnect with a new code.",
-  confirmDisconnect: "End active consultations and disconnect Hermes?",
-  disconnected: "Disconnected.",
-  snippetCopied: "Snippet copied.",
-  copyBlocked: "The browser blocked copying. Select the code and copy it manually.",
-  noLeads: "No inquiries yet.",
-  stActive: "Active",
-  stEnded: "Ended",
-  stExpired: "Expired",
-  stInterrupted: "Interrupted",
-  stDisconnected: "Disconnected",
-  stReconnected: "Reconnected",
-  subscriptionShort: "Subscription",
-  seconds: "{0}s",
-  // Demo page.
-  demoTitle: "Widget installation preview",
-  demoBanner: "This is an installation preview. The widget at the bottom right uses the real published settings and connection status.",
-  demoBrand: "Your website",
-  demoBack: "Back to consultation admin",
-  demoHeroHtml: "When a question comes up,<br />start a conversation.",
-  demoLead: "Visitors can ask about your services without leaving your website. Press the consultation button to try it.",
-  demoCard1: "About our services",
-  demoCard1Body: "Guide customers to the information they need.",
-  demoCard2: "Frequently asked questions",
-  demoCard2Body: "Conversations are based on your documents.",
-  demoCard3: "Contact",
-  demoCard3Body: "Visitors leave their contact details and a message for staff."
+  previousCleanup: "Cleaning up the previous connection. Please try again."
 };
 var ko = {
+  // Relay errors: the server responds { code, error: en[code] }; browsers translate by code.
   errGeneric: "\uC694\uCCAD\uC744 \uCC98\uB9AC\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4.",
   errInput: "\uC785\uB825\uAC12\uC744 \uD655\uC778\uD558\uC138\uC694.",
   errOrigin: "HTTPS \uD648\uD398\uC774\uC9C0 \uC8FC\uC18C\uB97C \uACBD\uB85C \uC5C6\uC774 \uC785\uB825\uD558\uC138\uC694.",
   errTooMany: "\uC694\uCCAD\uC774 \uB9CE\uC2B5\uB2C8\uB2E4. \uC7A0\uC2DC \uD6C4 \uB2E4\uC2DC \uC2DC\uB3C4\uD558\uC138\uC694.",
-  errDesktopOnly: "Desktop \uC124\uC815 \uD328\uB110\uC5D0\uC11C\uB9CC \uC811\uADFC\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4.",
-  errDesktopAuth: "Desktop \uC778\uC99D\uC744 \uC0AC\uC6A9\uD569\uB2C8\uB2E4.",
   errForbidden: "\uD5C8\uC6A9\uB418\uC9C0 \uC54A\uC740 \uC694\uCCAD\uC785\uB2C8\uB2E4.",
-  errLoginRequired: "\uB85C\uADF8\uC778\uC774 \uD544\uC694\uD569\uB2C8\uB2E4.",
   errSiteNotFound: "\uC0AC\uC774\uD2B8\uB97C \uCC3E\uC744 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4.",
   errLinkExpired: "\uC5F0\uACB0 \uC778\uC99D\uC774 \uB9CC\uB8CC\uB418\uC5C8\uC2B5\uB2C8\uB2E4. \uB2E4\uC2DC \uC5F0\uACB0\uD558\uC138\uC694.",
   errSessionEnded: "\uC0C1\uB2F4\uC774 \uC885\uB8CC\uB418\uC5C8\uC2B5\uB2C8\uB2E4. \uB2E4\uC2DC \uC2DC\uC791\uD558\uC138\uC694.",
   errConnectorOffline: "\uC0C1\uB2F4 \uC11C\uBC84\uAC00 \uC5F0\uACB0\uB418\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4. \uC81C\uACF5\uC790\uC5D0\uAC8C \uBB38\uC758\uD558\uC138\uC694.",
   errConnectorTimeout: "\uC0C1\uB2F4 \uC11C\uBC84 \uC751\uB2F5 \uC2DC\uAC04\uC774 \uCD08\uACFC\uB418\uC5C8\uC2B5\uB2C8\uB2E4.",
   errEnded: "\uC0C1\uB2F4\uC774 \uC885\uB8CC\uB418\uC5C8\uC2B5\uB2C8\uB2E4.",
-  errEmailTaken: "\uC774\uBBF8 \uB4F1\uB85D\uB41C \uC774\uBA54\uC77C\uC785\uB2C8\uB2E4.",
-  errBadCredentials: "\uC774\uBA54\uC77C \uB610\uB294 \uBE44\uBC00\uBC88\uD638\uB97C \uD655\uC778\uD558\uC138\uC694.",
   errSiteLimit: "\uACC4\uC815\uB2F9 20\uAC1C \uC0AC\uC774\uD2B8\uAE4C\uC9C0 \uC9C0\uC6D0\uD569\uB2C8\uB2E4.",
   errPairExpired: "\uC5F0\uACB0 \uCF54\uB4DC\uAC00 \uB9CC\uB8CC\uB418\uC5C8\uAC70\uB098 \uC774\uBBF8 \uC0AC\uC6A9\uB418\uC5C8\uC2B5\uB2C8\uB2E4.",
   errAlreadyWaiting: "\uC774\uBBF8 \uC791\uC5C5\uC744 \uAE30\uB2E4\uB9AC\uACE0 \uC788\uC2B5\uB2C8\uB2E4.",
@@ -44042,8 +43901,11 @@ var ko = {
   errRequestConflict: "\uAC19\uC740 \uC694\uCCAD ID\uC5D0 \uB2E4\uB978 \uB0B4\uC6A9\uC785\uB2C8\uB2E4.",
   errQuestionBusy: "\uC774\uC804 \uC9C8\uBB38\uC744 \uCC98\uB9AC\uD558\uACE0 \uC788\uC2B5\uB2C8\uB2E4.",
   errQuestionLimit: "\uC774 \uC0C1\uB2F4\uC758 \uC9C8\uBB38 \uD55C\uB3C4\uC5D0 \uB3C4\uB2EC\uD588\uC2B5\uB2C8\uB2E4.",
-  errUseDesktop: "Desktop \uC124\uC815 \uD328\uB110\uC744 \uC0AC\uC6A9\uD558\uC138\uC694.",
   errShuttingDown: "\uC11C\uBE44\uC2A4\uB97C \uC885\uB8CC\uD569\uB2C8\uB2E4.",
+  errNotFound: "\uCC3E\uC744 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4.",
+  errDailyQuestions: "\uC774 \uC6F9\uC0AC\uC774\uD2B8\uC758 \uC624\uB298 \uC9C8\uBB38 \uD55C\uB3C4\uC5D0 \uB3C4\uB2EC\uD588\uC2B5\uB2C8\uB2E4. \uBB38\uC758\uB97C \uB0A8\uAE38 \uC218 \uC788\uC2B5\uB2C8\uB2E4.",
+  errDailyLeads: "\uC624\uB298 \uBB38\uC758 \uC811\uC218 \uD55C\uB3C4\uC5D0 \uB3C4\uB2EC\uD588\uC2B5\uB2C8\uB2E4. \uB0B4\uC77C \uB2E4\uC2DC \uC2DC\uB3C4\uD574 \uC8FC\uC138\uC694.",
+  // Visitor frame.
   frameTitle: "AI \uC0C1\uB2F4",
   assistant: "AI \uC0C1\uB2F4\uC6D0",
   you: "\uB098",
@@ -44100,129 +43962,7 @@ var ko = {
   challengeFailed: "\uBD07 \uAC80\uC99D\uC5D0 \uC2E4\uD328\uD588\uC2B5\uB2C8\uB2E4.",
   challengeExpired: "\uBD07 \uAC80\uC99D\uC774 \uB9CC\uB8CC\uB418\uC5C8\uC2B5\uB2C8\uB2E4.",
   challengeStartFailed: "\uBD07 \uAC80\uC99D\uC744 \uC2DC\uC791\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4.",
-  previousCleanup: "\uC774\uC804 \uC5F0\uACB0\uC744 \uC815\uB9AC\uD558\uACE0 \uC788\uC2B5\uB2C8\uB2E4. \uB2E4\uC2DC \uC2DC\uB3C4\uD574 \uC8FC\uC138\uC694.",
-  adminTitle: "Hermes Consult \u2014 \uC0C1\uB2F4 \uAD00\uB9AC",
-  adminHeroHtml: "\uD648\uD398\uC774\uC9C0\uC5D0\uC11C \uC2DC\uC791\uD558\uB294<br />\uD55C \uBC88\uC758 \uB300\uD654.",
-  adminLeadHtml: "\uACE0\uAC1D\uC740 \uBC84\uD2BC\uC744 \uB204\uB974\uACE0,<br />\uB2F9\uC2E0\uC758 \uD5E4\uB974\uBA54\uC2A4\uB294 \uC0C1\uB2F4\uC744 \uC2DC\uC791\uD569\uB2C8\uB2E4.",
-  adminNoteHtml: "\uC0C1\uB2F4 \uC790\uB8CC\uC640 \uADDC\uCE59\uC740 \uD55C \uACF3\uC5D0\uC11C.<br />\uC11C\uBC84 \uC778\uC99D\uC815\uBCF4\uB294 \uC81C\uACF5\uC790\uC758 \uD658\uACBD\uC5D0.",
-  loginTitle: "\uC0C1\uB2F4 \uAD00\uB9AC\uC5D0 \uB85C\uADF8\uC778",
-  registerTitle: "\uC81C\uACF5\uC790 \uACC4\uC815 \uB9CC\uB4E4\uAE30",
-  providerSpace: "\uC11C\uBE44\uC2A4 \uC81C\uACF5\uC790\uB97C \uC704\uD55C \uACF5\uAC04\uC785\uB2C8\uB2E4.",
-  email: "\uC774\uBA54\uC77C",
-  password: "\uBE44\uBC00\uBC88\uD638",
-  passwordPlaceholder: "12\uC790 \uC774\uC0C1",
-  login: "\uB85C\uADF8\uC778",
-  register: "\uACC4\uC815 \uB9CC\uB4E4\uAE30",
-  toRegister: "\uCC98\uC74C\uC774\uB77C\uBA74 \uACC4\uC815 \uB9CC\uB4E4\uAE30",
-  toLogin: "\uC774\uBBF8 \uACC4\uC815\uC774 \uC788\uC5B4\uC694",
-  mySites: "\uB0B4 \uC0C1\uB2F4 \uC0AC\uC774\uD2B8",
-  newSite: "+ \uC0C8 \uC0C1\uB2F4 \uC0AC\uC774\uD2B8",
-  logout: "\uB85C\uADF8\uC544\uC6C3",
-  admin: "\uC0C1\uB2F4 \uAD00\uB9AC",
-  firstSite: "\uCCAB \uC0C1\uB2F4\uC6D0\uC744 \uB9CC\uB4E4\uC5B4 \uBCF4\uC138\uC694",
-  notConnected: "\uBBF8\uC5F0\uACB0",
-  tabSetup: "\uC0C1\uB2F4 \uC124\uC815",
-  tabConnect: "\uC5F0\uACB0\uACFC \uC124\uCE58",
-  tabActivity: "\uC0C1\uB2F4 \uAE30\uB85D",
-  setupTitle: "\uC5B4\uB5A4 \uC0C1\uB2F4\uC744 \uC81C\uACF5\uD558\uB098\uC694?",
-  setupHelp: "\uC800\uC7A5\uD558\uACE0 \uAC8C\uC2DC\uD558\uBA74 \uB2E4\uC74C \uC0C1\uB2F4\uBD80\uD130 \uC0C8 \uC124\uC815\uC774 \uC801\uC6A9\uB429\uB2C8\uB2E4. \uBBF8\uB9AC\uBCF4\uAE30\uB294 \uAC8C\uC2DC\uB41C \uC124\uC815\uC744 \uC0AC\uC6A9\uD569\uB2C8\uB2E4.",
-  siteName: "\uC0C1\uB2F4\uC6D0 \uC774\uB984",
-  siteNamePlaceholder: "\uC608: \uBAA8\uB178 \uC2A4\uD29C\uB514\uC624 \uC0C1\uB2F4\uC6D0",
-  greeting: "\uCCAB \uC778\uC0AC",
-  greetingPlaceholder: "\uC548\uB155\uD558\uC138\uC694. AI \uC0C1\uB2F4\uC6D0\uC785\uB2C8\uB2E4. \uBB34\uC5C7\uC744 \uB3C4\uC640\uB4DC\uB9B4\uAE4C\uC694?",
-  origins: "\uC124\uCE58\uD560 \uD648\uD398\uC774\uC9C0 \uC8FC\uC18C",
-  originsHelp: "\uACBD\uB85C \uC5C6\uC774 \uC8FC\uC18C\uB9CC \uC785\uB825\uD558\uC138\uC694. \uC5EC\uB7EC \uC0AC\uC774\uD2B8\uB294 \uC904\uBC14\uAFC8\uC73C\uB85C \uAD6C\uBD84\uD569\uB2C8\uB2E4.",
-  standardsTitle: "\uC0C1\uB2F4\uC758 \uAE30\uC900\uC744 \uC815\uD558\uC138\uC694",
-  standardsBody1: "\uD655\uC778\uB41C \uC790\uB8CC \uC548\uC5D0\uC11C \uB2F5\uD558\uB3C4\uB85D \uD558\uACE0, \uBAA8\uB974\uB294 \uC9C8\uBB38\uC5D0\uB294 \uBB38\uC758 \uB0A8\uAE30\uAE30\uB97C \uC548\uB0B4\uD569\uB2C8\uB2E4.",
-  standardsBody2: "\uCD08\uAE30 \uBC84\uC804\uC740 \uC790\uB8CC \uC548\uB0B4\uC640 \uBB38\uC758 \uC811\uC218\uB97C \uC9C0\uC6D0\uD569\uB2C8\uB2E4. \uACB0\uC81C\xB7\uD658\uBD88\xB7\uC608\uC57D \uBCC0\uACBD\uC740 \uC2E4\uD589\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.",
-  rules: "\uC0C1\uB2F4 \uADDC\uCE59",
-  rulesPlaceholder: "\uAC00\uACA9\uC744 \uC784\uC758\uB85C \uD655\uC815\uD558\uC9C0 \uC54A\uAE30. \uC790\uB8CC\uC5D0 \uC5C6\uB294 \uC815\uBCF4\uB294 \uB2F4\uB2F9\uC790 \uD655\uC778 \uC548\uB0B4.",
-  knowledge: "\uC0C1\uB2F4 \uC790\uB8CC",
-  importText: "\uD14D\uC2A4\uD2B8 \uD30C\uC77C \uBD88\uB7EC\uC624\uAE30",
-  knowledgePlaceholder: "\uD68C\uC0AC \uC18C\uAC1C, \uC81C\uACF5 \uC11C\uBE44\uC2A4, FAQ, \uAC00\uACA9\uACFC \uC815\uCC45\uC744 \uC785\uB825\uD558\uC138\uC694.",
-  knowledgeHelp: "\uCD5C\uB300 40,000\uC790. TXT\xB7Markdown \uD30C\uC77C\uC744 \uBD88\uB7EC\uC62C \uC218 \uC788\uC2B5\uB2C8\uB2E4.",
-  engine: "\uC74C\uC131 \uC5F0\uACB0",
-  engineApi: "GPT-Live API \xB7 \uC0AC\uC6A9\uB7C9 \uACFC\uAE08",
-  engineSubscription: "hermes-live \xB7 \uAD6C\uB3C5 \uC5F0\uACB0 (\uC2E4\uD5D8\uC801)",
-  language: "\uB2F5\uBCC0 \uC5B8\uC5B4",
-  languageAuto: "\uC790\uB3D9 (\uD398\uC774\uC9C0 \uC5B8\uC5B4)",
-  maxSeconds: "\uC0C1\uB2F4 \uCD5C\uB300 \uC2DC\uAC04 (\uCD08)",
-  maxConcurrent: "\uB3D9\uC2DC \uC0C1\uB2F4 \uC218",
-  dailySeconds: "\uD558\uB8E8 \uC608\uC57D \uD55C\uB3C4 (\uCD08)",
-  enginesNote: "\uC74C\uC131 \uC5D4\uC9C4\uC740 \uC790\uB3D9 \uC804\uD658\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. \uC790\uB8CC \uC870\uD68C\xB7\uD14D\uC2A4\uD2B8 \uB2F5\uBCC0\uC5D0\uB294 Hermes\uC5D0 \uC124\uC815\uB41C \uBAA8\uB378\uC774 \uC0AC\uC6A9\uB418\uBA70 \uBCC4\uB3C4 \uBE44\uC6A9\uC774 \uC0DD\uAE38 \uC218 \uC788\uC2B5\uB2C8\uB2E4. \uD558\uB8E8 \uD55C\uB3C4\uB294 \uC2DC\uC791\uD560 \uB54C \uCD5C\uB300 \uC0C1\uB2F4 \uC2DC\uAC04\uC744 \uC608\uC57D\uD558\uB294 \uBCF4\uC218\uC801\uC778 \uC81C\uD55C\uC785\uB2C8\uB2E4.",
-  unpublished: "\uAC8C\uC2DC \uC804",
-  saveDraft: "\uCD08\uC548 \uC800\uC7A5",
-  savePublish: "\uC800\uC7A5\uD558\uACE0 \uAC8C\uC2DC",
-  connectTitle: "\uD5E4\uB974\uBA54\uC2A4 \uC5F0\uACB0\uBD80\uD130 \uD648\uD398\uC774\uC9C0 \uC124\uCE58\uAE4C\uC9C0",
-  connectHelp: "\uC778\uC99D\uC815\uBCF4\uB294 \uD648\uD398\uC774\uC9C0 \uCF54\uB4DC\uC5D0 \uB123\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. \uC81C\uACF5\uC790 \uCEF4\uD4E8\uD130\uC5D0\uC11C \uC5F0\uACB0\uC744 \uC2DC\uC791\uD558\uC138\uC694.",
-  step1: "\uC81C\uACF5\uC790 \uC11C\uBC84\uC5D0 \uC5F0\uACB0 \uD50C\uB7EC\uADF8\uC778 \uC900\uBE44",
-  step1Help: "\uD504\uB85C\uC81D\uD2B8\uB97C \uC81C\uACF5\uC790 \uC11C\uBC84\uC5D0 \uC124\uCE58\uD55C \uB4A4 \uC544\uB798 \uBA85\uB839\uC744 \uC2E4\uD589\uD569\uB2C8\uB2E4. \uC124\uCE58 \uACBD\uB85C\uC640 \uD658\uACBD \uC900\uBE44\uB294 README\uB97C \uCC38\uACE0\uD558\uC138\uC694.",
-  step1NoteHtml: "\uAD6C\uB3C5 \uC5F0\uACB0\uC740 Codex \uB85C\uADF8\uC778\uC774 \uC788\uB294 \uC11C\uBC84\uC5D0\uC11C <code>--allow-subscription</code>\uC744 \uBA85\uC2DC\uD574\uC57C \uD569\uB2C8\uB2E4. API \uD0A4\uB294 \uC11C\uBC84\uC758 Hermes \uBE44\uBC00\uC815\uBCF4 \uC124\uC815\uC5D0\uC11C \uAD00\uB9AC\uD569\uB2C8\uB2E4.",
-  step2: "\uC77C\uD68C\uC6A9 \uCF54\uB4DC\uB85C \uC5F0\uACB0",
-  step2Help: "\uCF54\uB4DC\uB97C \uBC1C\uAE09\uD558\uACE0 \uCEE4\uB125\uD130\uC758 \uC785\uB825\uB780\uC5D0 \uBD99\uC5EC\uB123\uC73C\uC138\uC694. 5\uBD84 \uB3D9\uC548 \uD55C \uBC88\uB9CC \uC0AC\uC6A9\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4.",
-  pair: "\uC5F0\uACB0 \uCF54\uB4DC \uBC1C\uAE09",
-  disconnect: "\uC5F0\uACB0 \uD574\uC81C",
-  step3: "\uD648\uD398\uC774\uC9C0\uC5D0 \uC2A4\uB2C8\uD3AB \uBD99\uC5EC\uB123\uAE30",
-  step3HelpHtml: "\uC0AC\uC774\uD2B8 \uACF5\uD1B5 HTML\uC758 <code>&lt;/body&gt;</code> \uC55E \uB610\uB294 \uC678\uBD80 \uC2A4\uD06C\uB9BD\uD2B8 \uC124\uC815\uB780\uC5D0 \uBD99\uC5EC\uB123\uC73C\uC138\uC694.",
-  copySnippet: "\uC2A4\uB2C8\uD3AB \uBCF5\uC0AC",
-  preview: "\uC124\uCE58 \uBBF8\uB9AC\uBCF4\uAE30",
-  previewNote: "\uBBF8\uB9AC\uBCF4\uAE30 \uC8FC\uC18C\uB3C4 \uD5C8\uC6A9 \uD648\uD398\uC774\uC9C0 \uBAA9\uB85D\uC5D0 \uC788\uC5B4\uC57C \uD569\uB2C8\uB2E4. \uC74C\uC131\uC740 HTTPS \uB610\uB294 localhost\uC5D0\uC11C \uC791\uB3D9\uD569\uB2C8\uB2E4.",
-  activityTitle: "\uCD5C\uADFC \uC0C1\uB2F4\uACFC \uBB38\uC758",
-  activityHelp: "\uB300\uD654 \uC6D0\uBB38\xB7\uC74C\uC131\uC740 \uC800\uC7A5\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. \uC0C1\uB2F4 \uC2DC\uAC01\uACFC \uBC29\uBB38\uC790\uAC00 \uC81C\uCD9C\uD55C \uBB38\uC758\uB9CC \uBCF4\uAD00\uD569\uB2C8\uB2E4.",
-  refresh: "\uC0C8\uB85C\uACE0\uCE68",
-  leads: "\uC811\uC218\uB41C \uBB38\uC758",
-  recent: "\uCD5C\uADFC \uC0C1\uB2F4",
-  started: "\uC2DC\uC791",
-  engineColumn: "\uC5F0\uACB0 \uBC29\uC2DD",
-  used: "\uC0AC\uC6A9 \uC2DC\uAC04",
-  status: "\uC0C1\uD0DC",
-  requestFailed: "\uC694\uCCAD \uC2E4\uD328",
-  defaultSiteName: "\uC0C8 \uC0C1\uB2F4\uC6D0",
-  defaultRules: "\uC790\uB8CC\uC5D0 \uC5C6\uB294 \uB0B4\uC6A9\uC740 \uBAA8\uB978\uB2E4\uACE0 \uB2F5\uD558\uACE0 \uBB38\uC758 \uB0A8\uAE30\uAE30\uB97C \uC548\uB0B4\uD569\uB2C8\uB2E4. \uACAC\uC801\uC774\uB098 \uC77C\uC815\uC744 \uD655\uC815\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.",
-  hermesConnected: "\uD5E4\uB974\uBA54\uC2A4 \uC5F0\uACB0\uB428",
-  hermesDisconnected: "\uD5E4\uB974\uBA54\uC2A4 \uBBF8\uC5F0\uACB0",
-  capabilities: "\uC790\uB8CC \uC0C1\uB2F4 {0} / API \uC74C\uC131 {1} / \uAD6C\uB3C5 \uC74C\uC131 {2}{3}",
-  ready: "\uC900\uBE44\uB428",
-  notReady: "\uBBF8\uC900\uBE44",
-  keySet: "\uD0A4 \uC124\uC815\uB428",
-  keyMissing: "\uBBF8\uC124\uC815",
-  enabled: "\uD65C\uC131\uD654\uB428",
-  disabled: "\uBE44\uD65C\uC131",
-  demoConnector: " / \uB370\uBAA8 \uCEE4\uB125\uD130",
-  pairHint: "\uC5F0\uACB0 \uCF54\uB4DC\uB97C \uBC1C\uAE09\uD558\uACE0 \uC81C\uACF5\uC790 \uC11C\uBC84\uC5D0\uC11C \uCEE4\uB125\uD130\uB97C \uC2E4\uD589\uD558\uC138\uC694.",
-  revision: "\uAC8C\uC2DC \uBC84\uC804 {0} \xB7 \uC218\uC815\uC740 \uCD08\uC548\uC5D0 \uC800\uC7A5\uB429\uB2C8\uB2E4",
-  neverPublished: "\uC544\uC9C1 \uAC8C\uC2DC\uD558\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4",
-  siteCreated: "\uC0C8 \uC0C1\uB2F4\uC6D0\uC774 \uB9CC\uB4E4\uC5B4\uC84C\uC2B5\uB2C8\uB2E4. \uC790\uB8CC\uC640 \uADDC\uCE59\uC744 \uC785\uB825\uD55C \uB4A4 \uAC8C\uC2DC\uD558\uC138\uC694.",
-  published: "\uAC8C\uC2DC\uD588\uC2B5\uB2C8\uB2E4. \uC0C8 \uC0C1\uB2F4\uBD80\uD130 \uC774 \uC124\uC815\uC744 \uC0AC\uC6A9\uD569\uB2C8\uB2E4.",
-  draftSaved: "\uCD08\uC548\uC744 \uC800\uC7A5\uD588\uC2B5\uB2C8\uB2E4. \uC6B4\uC601 \uC0C1\uB2F4\uC5D0\uB294 \uC544\uC9C1 \uBC18\uC601\uB418\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4.",
-  knowledgeLimit: "\uC790\uB8CC\uB294 \uCD5C\uB300 40,000\uC790\uAE4C\uC9C0 \uC785\uB825\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4.",
-  fileLoaded: "\uD30C\uC77C\uC744 \uCD08\uC548\uC5D0 \uBD88\uB7EC\uC654\uC2B5\uB2C8\uB2E4. \uC800\uC7A5 \uB610\uB294 \uAC8C\uC2DC\uD558\uC138\uC694.",
-  pairValid: "\uC5F0\uACB0 \uCF54\uB4DC\uB294 5\uBD84 \uB3D9\uC548 \uC720\uD6A8\uD569\uB2C8\uB2E4. \uC11C\uBC84\uB97C \uC7AC\uC2DC\uC791\uD558\uBA74 \uC0C8 \uCF54\uB4DC\uB85C \uB2E4\uC2DC \uC5F0\uACB0\uD558\uC138\uC694.",
-  confirmDisconnect: "\uC9C4\uD589 \uC911\uC778 \uC0C1\uB2F4\uC744 \uC885\uB8CC\uD558\uACE0 \uD5E4\uB974\uBA54\uC2A4 \uC5F0\uACB0\uC744 \uD574\uC81C\uD560\uAE4C\uC694?",
-  disconnected: "\uC5F0\uACB0\uC744 \uD574\uC81C\uD588\uC2B5\uB2C8\uB2E4.",
-  snippetCopied: "\uC124\uCE58 \uCF54\uB4DC\uB97C \uBCF5\uC0AC\uD588\uC2B5\uB2C8\uB2E4.",
-  copyBlocked: "\uBE0C\uB77C\uC6B0\uC800\uAC00 \uBCF5\uC0AC\uB97C \uD5C8\uC6A9\uD558\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4. \uCF54\uB4DC\uB97C \uC9C1\uC811 \uC120\uD0DD\uD574 \uBCF5\uC0AC\uD558\uC138\uC694.",
-  noLeads: "\uC544\uC9C1 \uC811\uC218\uB41C \uBB38\uC758\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4.",
-  stActive: "\uC9C4\uD589 \uC911",
-  stEnded: "\uC885\uB8CC",
-  stExpired: "\uC2DC\uAC04 \uB9CC\uB8CC",
-  stInterrupted: "\uC5F0\uACB0 \uC911\uB2E8",
-  stDisconnected: "\uC5F0\uACB0 \uD574\uC81C",
-  stReconnected: "\uC7AC\uC5F0\uACB0",
-  subscriptionShort: "\uAD6C\uB3C5",
-  seconds: "{0}\uCD08",
-  demoTitle: "\uC0C1\uB2F4 \uC704\uC82F \uC124\uCE58 \uBBF8\uB9AC\uBCF4\uAE30",
-  demoBanner: "\uC124\uCE58 \uBBF8\uB9AC\uBCF4\uAE30\uC785\uB2C8\uB2E4. \uC624\uB978\uCABD \uC544\uB798\uC758 \uC704\uC82F\uC740 \uC2E4\uC81C \uAC8C\uC2DC \uC124\uC815\uACFC \uC5F0\uACB0 \uC0C1\uD0DC\uB97C \uC0AC\uC6A9\uD569\uB2C8\uB2E4.",
-  demoBrand: "\uB2F9\uC2E0\uC758 \uD648\uD398\uC774\uC9C0",
-  demoBack: "\uC0C1\uB2F4 \uAD00\uB9AC\uB85C \uB3CC\uC544\uAC00\uAE30",
-  demoHeroHtml: "\uC9C8\uBB38\uC774 \uB5A0\uC624\uB974\uB294 \uC21C\uAC04,<br />\uB300\uD654\uB97C \uC2DC\uC791\uD558\uC138\uC694.",
-  demoLead: "\uBC29\uBB38\uC790\uAC00 \uD648\uD398\uC774\uC9C0\uB97C \uB5A0\uB098\uC9C0 \uC54A\uACE0 \uC11C\uBE44\uC2A4\uC5D0 \uB300\uD574 \uBB3C\uC5B4\uBCFC \uC218 \uC788\uC2B5\uB2C8\uB2E4. \uC0C1\uB2F4 \uBC84\uD2BC\uC744 \uB20C\uB7EC \uC9C1\uC811 \uD655\uC778\uD574 \uBCF4\uC138\uC694.",
-  demoCard1: "\uC11C\uBE44\uC2A4 \uC18C\uAC1C",
-  demoCard1Body: "\uACE0\uAC1D\uC774 \uAD81\uAE08\uD574\uD558\uB294 \uC815\uBCF4\uB97C \uC548\uB0B4\uD569\uB2C8\uB2E4.",
-  demoCard2: "\uC790\uC8FC \uBB3B\uB294 \uC9C8\uBB38",
-  demoCard2Body: "\uB4F1\uB85D\uD55C \uC790\uB8CC\uB97C \uBC14\uD0D5\uC73C\uB85C \uB300\uD654\uD569\uB2C8\uB2E4.",
-  demoCard3: "\uC0C1\uB2F4 \uBB38\uC758",
-  demoCard3Body: "\uB2F4\uB2F9\uC790\uC5D0\uAC8C \uC5F0\uB77D\uCC98\uC640 \uBB38\uC758\uB97C \uB0A8\uAE41\uB2C8\uB2E4."
+  previousCleanup: "\uC774\uC804 \uC5F0\uACB0\uC744 \uC815\uB9AC\uD558\uACE0 \uC788\uC2B5\uB2C8\uB2E4. \uB2E4\uC2DC \uC2DC\uB3C4\uD574 \uC8FC\uC138\uC694."
 };
 var messages = { en, ko };
 function t(locale, key, ...values) {
@@ -44250,22 +43990,33 @@ function answerLanguage(setting, pageLanguage) {
   if (setting !== "auto") return setting;
   return typeof pageLanguage === "string" && languageTag.test(pageLanguage) ? pageLanguage : "";
 }
-var configSchema = external_exports.object({
+var configSchema = external_exports.strictObject({
+  // Stable key the service uses to match a configured site to its stored row.
+  key: external_exports.string().regex(/^[a-z0-9][a-z0-9-]{0,39}$/).optional(),
   name: external_exports.string().trim().min(1).max(80),
   origins: external_exports.array(originSchema).min(1).max(10),
-  engine: external_exports.enum(["api", "subscription"]),
+  // "text" answers typed questions only; "api" adds voice on the workspace's own key.
+  engine: external_exports.enum(["text", "api"]).default("text"),
   language: external_exports.string().max(35).refine((v) => v === "auto" || languageTag.test(v)).default("auto"),
-  greeting: external_exports.string().max(500),
-  rules: external_exports.string().max(6e3),
-  knowledge: external_exports.string().max(4e4),
-  maxSeconds: external_exports.number().int().min(30).max(600),
-  maxConcurrent: external_exports.number().int().min(1).max(5),
+  greeting: external_exports.string().max(500).default(""),
+  rules: external_exports.string().max(6e3).default(""),
+  knowledge: external_exports.string().max(4e4).default(""),
+  maxSeconds: external_exports.number().int().min(30).max(600).default(180),
+  maxConcurrent: external_exports.number().int().min(1).max(5).default(1),
   turnstileSiteKey: external_exports.string().max(100).regex(/^[a-zA-Z0-9_-]*$/).default(""),
   enabled: external_exports.boolean().default(true),
   dailyStarts: external_exports.number().int().min(1).max(100).default(3),
   cooldownSeconds: external_exports.number().int().min(0).max(3600).default(60),
-  dailySeconds: external_exports.number().int().min(60).max(86400)
+  dailySeconds: external_exports.number().int().min(60).max(86400).default(1800),
+  sessionQuestions: external_exports.number().int().min(1).max(60).default(30),
+  dailyQuestions: external_exports.number().int().min(1).max(2e3).default(200),
+  dailyLeads: external_exports.number().int().min(1).max(500).default(50)
 });
+function utcDayStart(now = Date.now()) {
+  const day = new Date(now);
+  day.setUTCHours(0, 0, 0, 0);
+  return day.getTime();
+}
 var HttpError = class extends Error {
   status;
   constructor(status, message) {
@@ -44278,12 +44029,15 @@ function fail(status, code) {
 }
 var bearer = (req) => req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : "";
 function createApp(options) {
+  if (!options.controlToken || options.controlToken.length < 32)
+    throw new Error("A control token of at least 32 characters is required");
   const store = new Store(options.dbPath), app = (0, import_express.default)(), origin2 = new URL(options.origin).origin;
   const pairs = /* @__PURE__ */ new Map(), links = /* @__PURE__ */ new Map(), sessions = /* @__PURE__ */ new Map();
   const pending = /* @__PURE__ */ new Map();
   const limits = /* @__PURE__ */ new Map();
   const web = fileURLToPath(new URL("../web/", import.meta.url));
   app.disable("x-powered-by");
+  if (options.proxyHops) app.set("trust proxy", options.proxyHops);
   app.use(import_express.default.json({ limit: "96kb" }));
   app.use((req, res, next) => {
     res.set({
@@ -44304,44 +44058,24 @@ function createApp(options) {
     if (++entry.count > max)
       fail(429, "errTooMany");
   }
-  function desktop(req) {
-    return !!options.desktopToken && hash2(bearer(req)) === hash2(options.desktopToken);
+  function control(req) {
+    return hash2(bearer(req)) === hash2(options.controlToken);
   }
-  if (options.desktopToken) {
-    store.run(
-      "INSERT OR IGNORE INTO providers VALUES (?,?,?)",
-      "desktop",
-      "desktop@local.invalid",
-      password(secret())
-    );
-    app.use("/api", (req, _res, next) => {
-      if (!desktop(req))
-        fail(403, "errDesktopOnly");
-      if (["/register", "/login", "/logout"].includes(req.path))
-        fail(403, "errDesktopAuth");
-      next();
-    });
-  }
-  function sameOrigin(req) {
-    if (desktop(req)) return;
-    if (req.headers.origin !== origin2) fail(403, "errForbidden");
-  }
-  function owner(req) {
-    if (desktop(req)) return "desktop";
-    const token = (req.headers.cookie ?? "").split(";").map((s) => s.trim()).find((s) => s.startsWith("hc_admin="))?.slice(9);
-    const login2 = token && store.get(
-      "SELECT owner FROM logins WHERE token=? AND expires>?",
-      hash2(token),
-      Date.now()
-    );
-    if (!login2) fail(401, "errLoginRequired");
-    return login2.owner;
-  }
+  const proxied = (req) => !!(req.headers["x-forwarded-for"] || req.headers.forwarded || req.headers.via);
+  app.use(["/api", "/connector"], (req, _res, next) => {
+    if (proxied(req)) fail(404, "errNotFound");
+    next();
+  });
+  app.use("/api", (req, _res, next) => {
+    if (!control(req)) fail(403, "errForbidden");
+    next();
+  });
+  const OWNER = "local";
   function siteFor(req) {
-    const user = owner(req), site = store.get(
+    const site = store.get(
       "SELECT * FROM sites WHERE id=? AND owner=?",
       req.params.id,
-      user
+      OWNER
     );
     if (!site) fail(404, "errSiteNotFound");
     return site;
@@ -44371,12 +44105,12 @@ function createApp(options) {
       id: row.id,
       name: c.name,
       greeting: c.greeting,
-      engine: c.engine,
+      engine: c.engine ?? "text",
       language: c.language ?? "auto",
       maxSeconds: c.maxSeconds,
       turnstileSiteKey: c.turnstileSiteKey || "",
       online: online(row.id),
-      voiceReady: online(row.id) && !!link?.capabilities[c.engine],
+      voiceReady: c.engine === "api" && online(row.id) && !!link?.capabilities.api,
       demo: !!link?.capabilities.demo
     };
   }
@@ -44443,72 +44177,6 @@ function createApp(options) {
       s.id
     );
   }
-  function cookie(res, token) {
-    res.setHeader(
-      "Set-Cookie",
-      `hc_admin=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200${origin2.startsWith("https:") ? "; Secure" : ""}`
-    );
-  }
-  function login(res, id) {
-    const token = secret();
-    store.run(
-      "INSERT INTO logins VALUES (?,?,?)",
-      hash2(token),
-      id,
-      Date.now() + 432e5
-    );
-    cookie(res, token);
-  }
-  app.post("/api/register", (req, res) => {
-    sameOrigin(req);
-    rate(`auth:${req.ip}`, 10, 6e5);
-    const b = external_exports.object({
-      email: external_exports.email().max(200),
-      password: external_exports.string().min(12).max(200)
-    }).parse(req.body);
-    const id = randomUUID();
-    try {
-      store.run(
-        "INSERT INTO providers VALUES (?,?,?)",
-        id,
-        b.email.toLowerCase(),
-        password(b.password)
-      );
-    } catch {
-      fail(409, "errEmailTaken");
-    }
-    login(res, id);
-    res.status(201).json({ email: b.email });
-  });
-  app.post("/api/login", (req, res) => {
-    sameOrigin(req);
-    rate(`auth:${req.ip}`, 10, 6e5);
-    const b = external_exports.object({ email: external_exports.email().max(200), password: external_exports.string().max(200) }).parse(req.body);
-    const p = store.get(
-      "SELECT * FROM providers WHERE email=?",
-      b.email.toLowerCase()
-    );
-    if (!p || !verify(b.password, p.password))
-      fail(401, "errBadCredentials");
-    login(res, p.id);
-    res.json({ email: p.email });
-  });
-  app.post("/api/logout", (req, res) => {
-    sameOrigin(req);
-    owner(req);
-    const token = (req.headers.cookie ?? "").split(";").map((s) => s.trim()).find((s) => s.startsWith("hc_admin=")).slice(9);
-    store.run("DELETE FROM logins WHERE token=?", hash2(token));
-    res.setHeader(
-      "Set-Cookie",
-      "hc_admin=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
-    );
-    res.json({ ok: true });
-  });
-  app.get("/api/me", (req, res) => {
-    res.json({
-      email: store.get("SELECT email FROM providers WHERE id=?", owner(req)).email
-    });
-  });
   function adminSite(s) {
     return {
       id: s.id,
@@ -44523,12 +44191,11 @@ function createApp(options) {
   app.get(
     "/api/sites",
     (req, res) => res.json(
-      store.all("SELECT * FROM sites WHERE owner=?", owner(req)).map(adminSite)
+      store.all("SELECT * FROM sites WHERE owner=?", OWNER).map(adminSite)
     )
   );
   app.post("/api/sites", (req, res) => {
-    sameOrigin(req);
-    const user = owner(req), config2 = configSchema.parse(req.body);
+    const user = OWNER, config2 = configSchema.parse(req.body);
     if (store.get("SELECT count(*) AS n FROM sites WHERE owner=?", user).n >= 20)
       fail(409, "errSiteLimit");
     const id = `site_${secret().slice(0, 16)}`;
@@ -44542,13 +44209,11 @@ function createApp(options) {
   });
   app.get("/api/sites/:id", (req, res) => res.json(adminSite(siteFor(req))));
   app.put("/api/sites/:id", (req, res) => {
-    sameOrigin(req);
     const s = siteFor(req), c = configSchema.parse(req.body);
     store.run("UPDATE sites SET draft=? WHERE id=?", JSON.stringify(c), s.id);
     res.json({ ok: true });
   });
   app.post("/api/sites/:id/publish", (req, res) => {
-    sameOrigin(req);
     const s = siteFor(req);
     configSchema.parse(JSON.parse(s.draft));
     store.run(
@@ -44562,7 +44227,6 @@ function createApp(options) {
     res.json({ revision: s.revision + 1 });
   });
   app.post("/api/sites/:id/pair", (req, res) => {
-    sameOrigin(req);
     const s = siteFor(req);
     for (const [key, p] of pairs) if (p.site === s.id) pairs.delete(key);
     const code = secret().slice(0, 16);
@@ -44570,7 +44234,6 @@ function createApp(options) {
     res.json({ code, expiresIn: 300 });
   });
   app.post("/api/sites/:id/disconnect", (req, res) => {
-    sameOrigin(req);
     const s = siteFor(req);
     for (const session of sessions.values())
       if (session.site === s.id) finish(session, "disconnected");
@@ -44587,11 +44250,48 @@ function createApp(options) {
         s.id
       ),
       leads: store.all(
-        "SELECT name,contact,message,created FROM leads WHERE site=? ORDER BY created DESC LIMIT 50",
+        "SELECT name,contact,message,created,handed,ref FROM leads WHERE site=? ORDER BY created DESC LIMIT 50",
         s.id
       )
     });
   });
+  app.get("/api/leads/pending", (_req, res) => {
+    res.json(
+      store.all(
+        "SELECT l.id,l.site,l.name,l.contact,l.message,l.created,s.draft,s.published FROM leads l JOIN sites s ON s.id=l.site WHERE l.handed=0 ORDER BY l.created LIMIT 20"
+      ).map((r) => {
+        const c = JSON.parse(r.published ?? r.draft);
+        return {
+          id: r.id,
+          site: r.site,
+          siteKey: c.key ?? "",
+          siteName: c.name,
+          name: r.name,
+          contact: r.contact,
+          message: r.message,
+          created: r.created
+        };
+      })
+    );
+  });
+  app.post("/api/leads/:id/handed", (req, res) => {
+    const b = external_exports.object({ ref: external_exports.string().max(200) }).parse(req.body);
+    const result = store.run(
+      "UPDATE leads SET handed=1,ref=? WHERE id=? AND handed=0",
+      b.ref,
+      req.params.id
+    );
+    if (!result.changes) fail(404, "errNotFound");
+    res.json({ ok: true });
+  });
+  function leadCap(site, config2) {
+    const n = store.get(
+      "SELECT count(*) AS n FROM leads WHERE site=? AND created>=?",
+      site,
+      utcDayStart()
+    ).n;
+    if (n >= config2.dailyLeads) fail(429, "errDailyLeads");
+  }
   app.post("/connector/pair", (req, res) => {
     rate(`pair:${req.ip}`, 15, 6e5);
     const { code } = external_exports.object({ code: external_exports.string().max(100) }).parse(req.body);
@@ -44686,7 +44386,7 @@ function createApp(options) {
         if (p.kind === "start")
           data = external_exports.object({
             answer: external_exports.string().min(1).max(65536),
-            engine: external_exports.enum(["api", "subscription"])
+            engine: external_exports.literal("api")
           }).parse(b.data);
         p.resolve(data);
       } catch {
@@ -44725,12 +44425,14 @@ function createApp(options) {
       req.params.id
     );
     if (!row) fail(404, "errNotPublished");
-    if (!JSON.parse(row.published).origins.includes(req.headers.origin ?? ""))
+    const published = configSchema.parse(JSON.parse(row.published));
+    if (!published.origins.includes(req.headers.origin ?? ""))
       fail(403, "errOriginNotAllowed");
     rate(`lead:${req.ip}:${req.params.id}`, 3, 6e5);
     const b = leadSchema.parse(req.body), id = randomUUID();
+    leadCap(req.params.id, published);
     store.run(
-      "INSERT INTO leads VALUES (?,?,?,?,?,?,?)",
+      "INSERT INTO leads(id,session,site,name,contact,message,created) VALUES (?,?,?,?,?,?,?)",
       id,
       id,
       req.params.id,
@@ -44768,8 +44470,7 @@ function createApp(options) {
       fail(503, "errServerOffline");
     if ([...sessions.values()].filter((s) => s.site === row.id).length >= config2.maxConcurrent)
       fail(429, "errBusy");
-    const today = /* @__PURE__ */ new Date();
-    today.setUTCHours(0, 0, 0, 0);
+    const today = new Date(utcDayStart());
     const usage = store.get(
       "SELECT coalesce(sum(reserved),0) AS total FROM consultations WHERE site=? AND started>=?",
       row.id,
@@ -44853,7 +44554,7 @@ function createApp(options) {
     const s = sessionFor(req);
     if (s.voice || s.starting) fail(409, "errVoiceStarted");
     const { offer } = external_exports.object({ offer: external_exports.string().min(10).max(65536) }).parse(req.body);
-    if (!links.get(s.site)?.capabilities[s.config.engine])
+    if (s.config.engine !== "api" || !links.get(s.site)?.capabilities.api)
       fail(
         503,
         "errVoiceNotReady"
@@ -44891,7 +44592,15 @@ function createApp(options) {
       return;
     }
     if (s.busy) fail(409, "errQuestionBusy");
-    if (++s.requests > 30) fail(429, "errQuestionLimit");
+    if (s.requests >= s.config.sessionQuestions) fail(429, "errQuestionLimit");
+    const asked = store.get(
+      "SELECT count(*) AS n FROM questions WHERE site=? AND at>=?",
+      s.site,
+      utcDayStart()
+    ).n;
+    if (asked >= s.config.dailyQuestions) fail(429, "errDailyQuestions");
+    s.requests++;
+    store.run("INSERT INTO questions VALUES (?,?)", s.site, Date.now());
     s.busy = true;
     try {
       const result = await enqueue(s.site, "ask", s.id, {
@@ -44914,8 +44623,9 @@ function createApp(options) {
   app.post("/public/session/lead", (req, res) => {
     const s = sessionFor(req);
     const b = leadSchema.parse(req.body);
+    leadCap(s.site, s.config);
     store.run(
-      "INSERT OR IGNORE INTO leads VALUES (?,?,?,?,?,?,?)",
+      "INSERT OR IGNORE INTO leads(id,session,site,name,contact,message,created) VALUES (?,?,?,?,?,?,?)",
       randomUUID(),
       s.id,
       s.site,
@@ -44945,14 +44655,9 @@ function createApp(options) {
     res.sendFile(web + "frame.html");
   });
   app.get("/health", (_req, res) => res.json({ ok: true }));
-  app.use((req, _res, next) => {
-    if (options.desktopToken && ["/", "/index.html", "/admin.js"].includes(req.path))
-      fail(404, "errUseDesktop");
-    next();
-  });
   app.use(
     import_express.default.static(web, {
-      index: "index.html",
+      index: false,
       setHeaders: (res, path) => {
         if (path.endsWith("widget.js"))
           res.setHeader("Cache-Control", "public,max-age=300");
@@ -44972,7 +44677,7 @@ function createApp(options) {
     for (const [key, p] of pairs) if (p.expires < now) pairs.delete(key);
     for (const [key, l] of limits) if (l.until < now) limits.delete(key);
     store.run("DELETE FROM starts WHERE started<?", now - 2 * 864e5);
-    store.run("DELETE FROM logins WHERE expires<?", now);
+    store.run("DELETE FROM questions WHERE at<?", now - 2 * 864e5);
     store.run("DELETE FROM leads WHERE created<?", now - 30 * 864e5);
     store.run("DELETE FROM consultations WHERE started<?", now - 30 * 864e5);
   }, 5e3);
@@ -44994,19 +44699,20 @@ function createApp(options) {
 }
 
 // src/index.ts
-var port = Number(process.env.PORT ?? 4317);
-var host = process.env.HOST ?? "127.0.0.1";
+var port = Number(process.env.PORT ?? 4318);
+var host = "127.0.0.1";
 var origin = process.env.PUBLIC_ORIGIN ?? `http://127.0.0.1:${port}`;
 var service = createApp({
   dbPath: process.env.DB_PATH ?? ".runtime/consult.sqlite",
   origin,
   turnstileSecret: process.env.HERMES_CONSULT_TURNSTILE_SECRET,
-  desktopToken: process.env.CONSULT_DESKTOP_TOKEN
+  controlToken: process.env.CONSULT_CONTROL_TOKEN ?? "",
+  proxyHops: Number(process.env.CONSULT_PROXY_HOPS ?? 0) || 0
 });
 var server = service.app.listen(
   port,
   host,
-  () => console.log(`Hermes Consult: ${origin}`)
+  () => console.log(`Consultation server on ${host}:${port} for ${origin}`)
 );
 for (const signal of ["SIGINT", "SIGTERM"])
   process.on(signal, () => {

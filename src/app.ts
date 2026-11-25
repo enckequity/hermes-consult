@@ -4,7 +4,7 @@ import type { Request, Response, NextFunction } from "express";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { Store, secret, hash, password, verify } from "./store.ts";
+import { Store, secret, hash } from "./store.ts";
 import { messages, t } from "../web/i18n.js";
 
 type MessageKey = keyof typeof messages.en;
@@ -41,20 +41,27 @@ export function answerLanguage(setting: string, pageLanguage: unknown) {
     ? pageLanguage
     : "";
 }
-const configSchema = z.object({
+// Caps are always on: every limit has a default and none can be zero or turned off.
+const configSchema = z.strictObject({
+  // Stable key the service uses to match a configured site to its stored row.
+  key: z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9-]{0,39}$/)
+    .optional(),
   name: z.string().trim().min(1).max(80),
   origins: z.array(originSchema).min(1).max(10),
-  engine: z.enum(["api", "subscription"]),
+  // "text" answers typed questions only; "api" adds voice on the workspace's own key.
+  engine: z.enum(["text", "api"]).default("text"),
   language: z
     .string()
     .max(35)
     .refine((v) => v === "auto" || languageTag.test(v))
     .default("auto"),
-  greeting: z.string().max(500),
-  rules: z.string().max(6000),
-  knowledge: z.string().max(40000),
-  maxSeconds: z.number().int().min(30).max(600),
-  maxConcurrent: z.number().int().min(1).max(5),
+  greeting: z.string().max(500).default(""),
+  rules: z.string().max(6000).default(""),
+  knowledge: z.string().max(40000).default(""),
+  maxSeconds: z.number().int().min(30).max(600).default(180),
+  maxConcurrent: z.number().int().min(1).max(5).default(1),
   turnstileSiteKey: z
     .string()
     .max(100)
@@ -63,8 +70,17 @@ const configSchema = z.object({
   enabled: z.boolean().default(true),
   dailyStarts: z.number().int().min(1).max(100).default(3),
   cooldownSeconds: z.number().int().min(0).max(3600).default(60),
-  dailySeconds: z.number().int().min(60).max(86400),
+  dailySeconds: z.number().int().min(60).max(86400).default(1800),
+  sessionQuestions: z.number().int().min(1).max(60).default(30),
+  dailyQuestions: z.number().int().min(1).max(2000).default(200),
+  dailyLeads: z.number().int().min(1).max(500).default(50),
 });
+export { configSchema };
+function utcDayStart(now = Date.now()) {
+  const day = new Date(now);
+  day.setUTCHours(0, 0, 0, 0);
+  return day.getTime();
+}
 type Config = z.infer<typeof configSchema>;
 type Job = {
   id: string;
@@ -115,9 +131,13 @@ const bearer = (req: Request) =>
 export function createApp(options: {
   dbPath: string;
   origin: string;
-  desktopToken?: string;
+  controlToken: string;
   turnstileSecret?: string;
+  proxyHops?: number;
 }) {
+  // No account system: the only administrator is the local service holding this token.
+  if (!options.controlToken || options.controlToken.length < 32)
+    throw new Error("A control token of at least 32 characters is required");
   const store = new Store(options.dbPath),
     app = express(),
     origin = new URL(options.origin).origin;
@@ -138,6 +158,8 @@ export function createApp(options: {
   const limits = new Map<string, { count: number; until: number }>();
   const web = fileURLToPath(new URL("../web/", import.meta.url));
   app.disable("x-powered-by");
+  // Behind a reverse proxy every visitor shares the proxy's address unless its hops are trusted.
+  if (options.proxyHops) app.set("trust proxy", options.proxyHops);
   app.use(express.json({ limit: "96kb" }));
   app.use((req, res, next) => {
     res.set({
@@ -158,54 +180,28 @@ export function createApp(options: {
     if (++entry.count > max)
       fail(429, "errTooMany");
   }
-  function desktop(req: Request) {
-    return (
-      !!options.desktopToken && hash(bearer(req)) === hash(options.desktopToken)
-    );
+  function control(req: Request) {
+    return hash(bearer(req)) === hash(options.controlToken);
   }
-  if (options.desktopToken) {
-    store.run(
-      "INSERT OR IGNORE INTO providers VALUES (?,?,?)",
-      "desktop",
-      "desktop@local.invalid",
-      password(secret()),
-    );
-    app.use("/api", (req, _res, next) => {
-      if (!desktop(req))
-        fail(403, "errDesktopOnly");
-      if (["/register", "/login", "/logout"].includes(req.path))
-        fail(403, "errDesktopAuth");
-      next();
-    });
-  }
-  function sameOrigin(req: Request) {
-    if (desktop(req)) return;
-    if (req.headers.origin !== origin) fail(403, "errForbidden");
-  }
-  function owner(req: Request) {
-    if (desktop(req)) return "desktop";
-    const token = (req.headers.cookie ?? "")
-      .split(";")
-      .map((s) => s.trim())
-      .find((s) => s.startsWith("hc_admin="))
-      ?.slice(9);
-    const login =
-      token &&
-      store.get(
-        "SELECT owner FROM logins WHERE token=? AND expires>?",
-        hash(token),
-        Date.now(),
-      );
-    if (!login) fail(401, "errLoginRequired");
-    return login.owner as string;
-  }
+  // The control and connector APIs are for local processes only. A request that came
+  // through a proxy (the public origin) is refused even before its credential is checked.
+  const proxied = (req: Request) =>
+    !!(req.headers["x-forwarded-for"] || req.headers.forwarded || req.headers.via);
+  app.use(["/api", "/connector"], (req, _res, next) => {
+    if (proxied(req)) fail(404, "errNotFound");
+    next();
+  });
+  app.use("/api", (req, _res, next) => {
+    if (!control(req)) fail(403, "errForbidden");
+    next();
+  });
+  const OWNER = "local";
   function siteFor(req: Request) {
-    const user = owner(req),
-      site = store.get(
-        "SELECT * FROM sites WHERE id=? AND owner=?",
-        req.params.id,
-        user,
-      );
+    const site = store.get(
+      "SELECT * FROM sites WHERE id=? AND owner=?",
+      req.params.id,
+      OWNER,
+    );
     if (!site) fail(404, "errSiteNotFound");
     return site;
   }
@@ -234,12 +230,12 @@ export function createApp(options: {
       id: row.id,
       name: c.name,
       greeting: c.greeting,
-      engine: c.engine,
+      engine: c.engine ?? "text",
       language: c.language ?? "auto",
       maxSeconds: c.maxSeconds,
       turnstileSiteKey: c.turnstileSiteKey || "",
       online: online(row.id),
-      voiceReady: online(row.id) && !!link?.capabilities[c.engine],
+      voiceReady: c.engine === "api" && online(row.id) && !!link?.capabilities.api,
       demo: !!link?.capabilities.demo,
     };
   }
@@ -311,81 +307,6 @@ export function createApp(options: {
       s.id,
     );
   }
-  function cookie(res: Response, token: string) {
-    res.setHeader(
-      "Set-Cookie",
-      `hc_admin=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200${origin.startsWith("https:") ? "; Secure" : ""}`,
-    );
-  }
-  function login(res: Response, id: string) {
-    const token = secret();
-    store.run(
-      "INSERT INTO logins VALUES (?,?,?)",
-      hash(token),
-      id,
-      Date.now() + 43200000,
-    );
-    cookie(res, token);
-  }
-  app.post("/api/register", (req, res) => {
-    sameOrigin(req);
-    rate(`auth:${req.ip}`, 10, 600000);
-    const b = z
-      .object({
-        email: z.email().max(200),
-        password: z.string().min(12).max(200),
-      })
-      .parse(req.body);
-    const id = randomUUID();
-    try {
-      store.run(
-        "INSERT INTO providers VALUES (?,?,?)",
-        id,
-        b.email.toLowerCase(),
-        password(b.password),
-      );
-    } catch {
-      fail(409, "errEmailTaken");
-    }
-    login(res, id);
-    res.status(201).json({ email: b.email });
-  });
-  app.post("/api/login", (req, res) => {
-    sameOrigin(req);
-    rate(`auth:${req.ip}`, 10, 600000);
-    const b = z
-      .object({ email: z.email().max(200), password: z.string().max(200) })
-      .parse(req.body);
-    const p = store.get(
-      "SELECT * FROM providers WHERE email=?",
-      b.email.toLowerCase(),
-    );
-    if (!p || !verify(b.password, p.password))
-      fail(401, "errBadCredentials");
-    login(res, p.id);
-    res.json({ email: p.email });
-  });
-  app.post("/api/logout", (req, res) => {
-    sameOrigin(req);
-    owner(req);
-    const token = (req.headers.cookie ?? "")
-      .split(";")
-      .map((s) => s.trim())
-      .find((s) => s.startsWith("hc_admin="))!
-      .slice(9);
-    store.run("DELETE FROM logins WHERE token=?", hash(token));
-    res.setHeader(
-      "Set-Cookie",
-      "hc_admin=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
-    );
-    res.json({ ok: true });
-  });
-  app.get("/api/me", (req, res) => {
-    res.json({
-      email: store.get("SELECT email FROM providers WHERE id=?", owner(req))
-        .email,
-    });
-  });
   function adminSite(s: any) {
     return {
       id: s.id,
@@ -399,12 +320,11 @@ export function createApp(options: {
   }
   app.get("/api/sites", (req, res) =>
     res.json(
-      store.all("SELECT * FROM sites WHERE owner=?", owner(req)).map(adminSite),
+      store.all("SELECT * FROM sites WHERE owner=?", OWNER).map(adminSite),
     ),
   );
   app.post("/api/sites", (req, res) => {
-    sameOrigin(req);
-    const user = owner(req),
+    const user = OWNER,
       config = configSchema.parse(req.body);
     if (
       store.get("SELECT count(*) AS n FROM sites WHERE owner=?", user).n >= 20
@@ -423,14 +343,12 @@ export function createApp(options: {
   });
   app.get("/api/sites/:id", (req, res) => res.json(adminSite(siteFor(req))));
   app.put("/api/sites/:id", (req, res) => {
-    sameOrigin(req);
     const s = siteFor(req),
       c = configSchema.parse(req.body);
     store.run("UPDATE sites SET draft=? WHERE id=?", JSON.stringify(c), s.id);
     res.json({ ok: true });
   });
   app.post("/api/sites/:id/publish", (req, res) => {
-    sameOrigin(req);
     const s = siteFor(req);
     configSchema.parse(JSON.parse(s.draft));
     store.run(
@@ -443,7 +361,6 @@ export function createApp(options: {
     res.json({ revision: s.revision + 1 });
   });
   app.post("/api/sites/:id/pair", (req, res) => {
-    sameOrigin(req);
     const s = siteFor(req);
     for (const [key, p] of pairs) if (p.site === s.id) pairs.delete(key);
     const code = secret().slice(0, 16);
@@ -451,7 +368,6 @@ export function createApp(options: {
     res.json({ code, expiresIn: 300 });
   });
   app.post("/api/sites/:id/disconnect", (req, res) => {
-    sameOrigin(req);
     const s = siteFor(req);
     for (const session of sessions.values())
       if (session.site === s.id) finish(session, "disconnected");
@@ -468,11 +384,51 @@ export function createApp(options: {
         s.id,
       ),
       leads: store.all(
-        "SELECT name,contact,message,created FROM leads WHERE site=? ORDER BY created DESC LIMIT 50",
+        "SELECT name,contact,message,created,handed,ref FROM leads WHERE site=? ORDER BY created DESC LIMIT 50",
         s.id,
       ),
     });
   });
+  // Lead handoff: the service takes leads not yet handed off and acknowledges each one.
+  app.get("/api/leads/pending", (_req, res) => {
+    res.json(
+      store
+        .all(
+          "SELECT l.id,l.site,l.name,l.contact,l.message,l.created,s.draft,s.published FROM leads l JOIN sites s ON s.id=l.site WHERE l.handed=0 ORDER BY l.created LIMIT 20",
+        )
+        .map((r) => {
+          const c = JSON.parse(r.published ?? r.draft);
+          return {
+            id: r.id,
+            site: r.site,
+            siteKey: c.key ?? "",
+            siteName: c.name,
+            name: r.name,
+            contact: r.contact,
+            message: r.message,
+            created: r.created,
+          };
+        }),
+    );
+  });
+  app.post("/api/leads/:id/handed", (req, res) => {
+    const b = z.object({ ref: z.string().max(200) }).parse(req.body);
+    const result = store.run(
+      "UPDATE leads SET handed=1,ref=? WHERE id=? AND handed=0",
+      b.ref,
+      req.params.id,
+    );
+    if (!result.changes) fail(404, "errNotFound");
+    res.json({ ok: true });
+  });
+  function leadCap(site: string, config: Config) {
+    const n = store.get(
+      "SELECT count(*) AS n FROM leads WHERE site=? AND created>=?",
+      site,
+      utcDayStart(),
+    ).n;
+    if (n >= config.dailyLeads) fail(429, "errDailyLeads");
+  }
   app.post("/connector/pair", (req, res) => {
     rate(`pair:${req.ip}`, 15, 600000);
     const { code } = z.object({ code: z.string().max(100) }).parse(req.body);
@@ -575,7 +531,7 @@ export function createApp(options: {
           data = z
             .object({
               answer: z.string().min(1).max(65536),
-              engine: z.enum(["api", "subscription"]),
+              engine: z.literal("api"),
             })
             .parse(b.data);
         p.resolve(data);
@@ -615,13 +571,15 @@ export function createApp(options: {
       req.params.id,
     );
     if (!row) fail(404, "errNotPublished");
-    if (!JSON.parse(row.published).origins.includes(req.headers.origin ?? ""))
+    const published = configSchema.parse(JSON.parse(row.published));
+    if (!published.origins.includes(req.headers.origin ?? ""))
       fail(403, "errOriginNotAllowed");
     rate(`lead:${req.ip}:${req.params.id}`, 3, 600000);
     const b = leadSchema.parse(req.body),
       id = randomUUID();
+    leadCap(req.params.id, published);
     store.run(
-      "INSERT INTO leads VALUES (?,?,?,?,?,?,?)",
+      "INSERT INTO leads(id,session,site,name,contact,message,created) VALUES (?,?,?,?,?,?,?)",
       id,
       id,
       req.params.id,
@@ -667,8 +625,7 @@ export function createApp(options: {
       config.maxConcurrent
     )
       fail(429, "errBusy");
-    const today = new Date();
-    today.setUTCHours(0, 0, 0, 0);
+    const today = new Date(utcDayStart());
     const usage = store.get(
       "SELECT coalesce(sum(reserved),0) AS total FROM consultations WHERE site=? AND started>=?",
       row.id,
@@ -757,7 +714,7 @@ export function createApp(options: {
     const { offer } = z
       .object({ offer: z.string().min(10).max(65536) })
       .parse(req.body);
-    if (!links.get(s.site)?.capabilities[s.config.engine])
+    if (s.config.engine !== "api" || !links.get(s.site)?.capabilities.api)
       fail(
         503,
         "errVoiceNotReady",
@@ -797,7 +754,15 @@ export function createApp(options: {
       return;
     }
     if (s.busy) fail(409, "errQuestionBusy");
-    if (++s.requests > 30) fail(429, "errQuestionLimit");
+    if (s.requests >= s.config.sessionQuestions) fail(429, "errQuestionLimit");
+    const asked = store.get(
+      "SELECT count(*) AS n FROM questions WHERE site=? AND at>=?",
+      s.site,
+      utcDayStart(),
+    ).n;
+    if (asked >= s.config.dailyQuestions) fail(429, "errDailyQuestions");
+    s.requests++;
+    store.run("INSERT INTO questions VALUES (?,?)", s.site, Date.now());
     s.busy = true;
     try {
       const result = await enqueue(s.site, "ask", s.id, {
@@ -820,8 +785,9 @@ export function createApp(options: {
   app.post("/public/session/lead", (req, res) => {
     const s = sessionFor(req);
     const b = leadSchema.parse(req.body);
+    leadCap(s.site, s.config);
     store.run(
-      "INSERT OR IGNORE INTO leads VALUES (?,?,?,?,?,?,?)",
+      "INSERT OR IGNORE INTO leads(id,session,site,name,contact,message,created) VALUES (?,?,?,?,?,?,?)",
       randomUUID(),
       s.id,
       s.site,
@@ -851,17 +817,9 @@ export function createApp(options: {
     res.sendFile(web + "frame.html");
   });
   app.get("/health", (_req, res) => res.json({ ok: true }));
-  app.use((req, _res, next) => {
-    if (
-      options.desktopToken &&
-      ["/", "/index.html", "/admin.js"].includes(req.path)
-    )
-      fail(404, "errUseDesktop");
-    next();
-  });
   app.use(
     express.static(web, {
-      index: "index.html",
+      index: false,
       setHeaders: (res, path) => {
         if (path.endsWith("widget.js"))
           res.setHeader("Cache-Control", "public,max-age=300");
@@ -894,7 +852,7 @@ export function createApp(options: {
     for (const [key, p] of pairs) if (p.expires < now) pairs.delete(key);
     for (const [key, l] of limits) if (l.until < now) limits.delete(key);
     store.run("DELETE FROM starts WHERE started<?", now - 2 * 86400000);
-    store.run("DELETE FROM logins WHERE expires<?", now);
+    store.run("DELETE FROM questions WHERE at<?", now - 2 * 86400000);
     store.run("DELETE FROM leads WHERE created<?", now - 30 * 86400000);
     store.run("DELETE FROM consultations WHERE started<?", now - 30 * 86400000);
   }, 5000);
